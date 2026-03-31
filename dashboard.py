@@ -37,6 +37,29 @@ DB_PATH = "/var/lib/bot-engine/bot_scores.db"
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "changeme")
 
+# ── IP allowlist ──
+# Comma-separated list of IPs/CIDRs allowed to access the dashboard.
+# Default: localhost only. Set DASHBOARD_ALLOW_IPS="0.0.0.0/0" to allow all.
+_raw_allow = os.environ.get("DASHBOARD_ALLOW_IPS", "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16")
+import ipaddress as _ipaddress
+DASHBOARD_ALLOW_NETS: list[_ipaddress.IPv4Network | _ipaddress.IPv6Network] = []
+for _cidr in _raw_allow.split(","):
+    _cidr = _cidr.strip()
+    if _cidr:
+        try:
+            DASHBOARD_ALLOW_NETS.append(_ipaddress.ip_network(_cidr, strict=False))
+        except ValueError:
+            pass
+
+
+def _ip_allowed(client_ip: str) -> bool:
+    """Check if a client IP is in the allowlist."""
+    try:
+        addr = _ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in DASHBOARD_ALLOW_NETS)
+
 
 def _verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     """Validate basic auth credentials with constant-time comparison."""
@@ -410,6 +433,11 @@ def startup():
 async def auth_middleware(request: Request, call_next):
     if request.url.path == "/api/health":
         return await call_next(request)
+
+    # IP allowlist check (before auth, to reject early)
+    client_ip = request.client.host if request.client else ""
+    if not _ip_allowed(client_ip):
+        return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
     import base64
     auth_header = request.headers.get("authorization", "")

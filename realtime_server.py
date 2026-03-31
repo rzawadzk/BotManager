@@ -876,18 +876,24 @@ class RealtimeScoringServer:
             self.metrics.reset_latency()
 
     async def _snapshot_saver(self):
-        db = None
-        try:
-            db = ScoreDatabase(self.config["DB_PATH"])
-            while self._running:
-                await asyncio.sleep(self.config["SNAPSHOT_INTERVAL"])
-                saved = 0
-                for threat in list(self.engine.scores.values()):
-                    if threat.total_score > 0:
-                        db.save_score(threat)
-                        saved += 1
-                self.logger.info(f"[SNAPSHOT] Saved {saved} scores to DB")
+        db: Optional[ScoreDatabase] = None
+        while self._running:
+            await asyncio.sleep(self.config["SNAPSHOT_INTERVAL"])
+            try:
+                # Lazy-connect / reconnect on failure
+                if db is None:
+                    db = ScoreDatabase(self.config["DB_PATH"])
 
+                # Batch save all non-zero scores in one transaction
+                to_save = [
+                    t for t in self.engine.scores.values()
+                    if t.total_score > 0
+                ]
+                if to_save:
+                    saved = db.save_scores_batch(to_save)
+                    self.logger.info(f"[SNAPSHOT] Saved {saved} scores to DB")
+
+                # Update Nginx blocklist
                 blocklist = self.engine.get_aggregated_blocklist()
                 if blocklist:
                     BlocklistWriter.write_nginx_deny(
@@ -896,11 +902,19 @@ class RealtimeScoringServer:
                             "/etc/nginx/conf.d/dynamic_blocklist.conf"
                         )
                     )
-        except Exception as e:
-            self.logger.error(f"Snapshot error: {e}", exc_info=True)
-        finally:
-            if db:
-                db.close()
+            except Exception as e:
+                self.logger.error(f"Snapshot error: {e}", exc_info=True)
+                # Force reconnect on next cycle
+                if db:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+                    db = None
+
+        # Cleanup on shutdown
+        if db:
+            db.close()
 
     async def _challenge_cleanup(self):
         while self._running:

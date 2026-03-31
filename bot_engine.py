@@ -1236,6 +1236,29 @@ class ScoreDatabase:
         ))
         self.conn.commit()
 
+    def save_scores_batch(self, threats: list[ThreatScore]) -> int:
+        """Batch insert/update scores in a single transaction. Returns count saved."""
+        now = time.time()
+        rows = [
+            (
+                t.ip, t.total_score, t.classification,
+                ",".join(t.reasons), t.first_seen, t.last_seen,
+                t.request_count, now, t.ml_score,
+                1 if t.identity_verified else 0, t.session_id,
+                1 if t.is_agentic_ai else 0, 1 if t.honeypot_hit else 0,
+            )
+            for t in threats
+        ]
+        self.conn.executemany("""
+            INSERT OR REPLACE INTO scores
+            (ip, total_score, classification, reasons, first_seen,
+             last_seen, request_count, updated_at, ml_score,
+             identity_verified, session_id, is_agentic_ai, honeypot_hit)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        self.conn.commit()
+        return len(rows)
+
     def load_scores(self) -> dict[str, ThreatScore]:
         """Load all scores from the database."""
         cursor = self.conn.execute("""
@@ -1277,8 +1300,9 @@ class BlocklistWriter:
     """Write Nginx deny directives for blocked IPs."""
 
     @staticmethod
-    def write_nginx_deny(ips: list[str], output_path: str) -> None:
-        """Write an Nginx-compatible blocklist file."""
+    def write_nginx_deny(ips: list[str], output_path: str,
+                         reload_nginx: bool = True) -> None:
+        """Write an Nginx-compatible blocklist file and optionally reload Nginx."""
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         lines = [f"deny {ip};" for ip in sorted(ips)]
         content = (
@@ -1293,3 +1317,26 @@ class BlocklistWriter:
         with open(tmp_path, "w") as f:
             f.write(content)
         os.replace(tmp_path, output_path)
+
+        if reload_nginx:
+            BlocklistWriter.reload_nginx()
+
+    @staticmethod
+    def reload_nginx() -> bool:
+        """Send reload signal to Nginx. Returns True on success."""
+        import subprocess
+        # Try nginx -s reload first (works without knowing the PID)
+        for cmd in (
+            ["nginx", "-s", "reload"],
+            ["openresty", "-s", "reload"],
+            ["systemctl", "reload", "nginx"],
+        ):
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        return False
