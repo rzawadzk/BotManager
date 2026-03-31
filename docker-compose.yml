@@ -1,0 +1,83 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Bot Engine v2.1 — Docker Compose
+# ═══════════════════════════════════════════════════════════════════════════════
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f scoring
+#
+# For lowest latency, the scoring server uses --network=host so Nginx
+# can reach it via localhost:9999 without Docker bridge overhead.
+# The dashboard runs in bridge mode (latency doesn't matter for a UI).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+services:
+  # ── Scoring Server (latency-critical) ──
+  scoring:
+    build: .
+    container_name: bot-scoring
+    network_mode: host
+    command:
+      - python3
+      - realtime_server.py
+      - --host
+      - "127.0.0.1"
+      - --port
+      - "9999"
+    environment:
+      BOT_HMAC_SECRET: "${BOT_HMAC_SECRET:-change_me_in_production}"
+      BOT_DB_PATH: /var/lib/bot-engine/bot_scores.db
+      BOT_BLOCKLIST_OUTPUT: /data/nginx/dynamic_blocklist.conf
+    volumes:
+      - bot-data:/var/lib/bot-engine
+      - nginx-conf:/data/nginx
+      # Optional: mount a pre-trained ONNX model
+      # - ./bot_model.onnx:/var/lib/bot-engine/bot_model.onnx:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9999/_bot_health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ── Dashboard (not latency-critical) ──
+  dashboard:
+    build: .
+    container_name: bot-dashboard
+    command:
+      - python3
+      - dashboard.py
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --db
+      - /var/lib/bot-engine/bot_scores.db
+    environment:
+      DASHBOARD_USER: "${DASHBOARD_USER:-admin}"
+      DASHBOARD_PASS: "${DASHBOARD_PASS:-changeme}"
+    volumes:
+      - bot-data:/var/lib/bot-engine:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    depends_on:
+      scoring:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+volumes:
+  bot-data:
+    driver: local
+  nginx-conf:
+    driver: local

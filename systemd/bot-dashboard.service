@@ -1,0 +1,29 @@
+[Unit]
+Description=Bot Engine v2.1 — Management Dashboard
+After=network.target bot-engine.service
+Wants=bot-engine.service
+
+[Service]
+Type=simple
+User=bot-engine
+Group=bot-engine
+ExecStart=/usr/bin/python3 /opt/bot-engine/dashboard.py \
+    --host 127.0.0.1 --port 8080 \
+    --db /var/lib/bot-engine/bot_scores.db
+Restart=always
+RestartSec=5
+
+Environment=BOT_DB_PATH=/var/lib/bot-engine/bot_scores.db
+EnvironmentFile=-/etc/bot-engine/env
+
+StateDirectory=bot-engine
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bot-engine
+PrivateTmp=true
+NoNewPrivileges=true
+
+LimitNOFILE=4096
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

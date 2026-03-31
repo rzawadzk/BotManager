@@ -1,0 +1,27 @@
+# Bot Engine v2.1 — Dependencies
+# Python 3.10+ required
+#
+# ── Core (scoring server) ──
+# No external dependencies — runs on stdlib only.
+# The following are optional performance/feature enhancements:
+
+# ~30% faster async event loop
+uvloop>=0.19.0
+
+# ── ML Inference (optional — engine degrades gracefully without these) ──
+onnxruntime>=1.17.0
+numpy>=1.24.0
+
+# ── ML Training (only needed on training machine, not production) ──
+xgboost>=2.0.0
+scikit-learn>=1.4.0
+skl2onnx>=1.16.0
+onnxmltools>=1.12.0
+
+# ── Dashboard ──
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# ── Dashboard (optional extras) ──
+# python-multipart is needed for FastAPI form handling
+python-multipart>=0.0.6
