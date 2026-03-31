@@ -1,0 +1,27 @@
+# /etc/logrotate.d/bot-engine
+# Rotate Nginx bot-engine access logs and any file-based engine logs.
+
+/var/log/nginx/bot_access.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 $(cat /var/run/nginx.pid) || true
+    endscript
+}
+
+/var/log/bot-engine/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 bot-engine bot-engine
+    copytruncate
+}

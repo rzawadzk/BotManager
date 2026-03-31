@@ -415,6 +415,9 @@ class RealtimeScoringServer:
         self._load_persisted_scores()
         self.metrics = Metrics()
         self.rate_tracker = RateTracker(window_seconds=10)
+        # Separate rate tracker for challenge/captcha endpoints (5 attempts per 60s)
+        self._challenge_rate = RateTracker(window_seconds=60, max_ips=50_000)
+        self._challenge_rate_limit = 5
         self.challenges = ChallengeStore(
             ttl=self.config["CHALLENGE_COOKIE_TTL"]
         )
@@ -553,7 +556,11 @@ class RealtimeScoringServer:
 
                 # ── Health check endpoint ──
                 if original_uri == "/_bot_health":
-                    response = HTTPParser.build_response(200, body='{"status":"ok"}')
+                    health = self._deep_health_check()
+                    status = 200 if health["status"] == "ok" else 503
+                    response = HTTPParser.build_response(
+                        status, body=json.dumps(health)
+                    )
                     writer.write(response)
                     await writer.drain()
                     return
@@ -573,14 +580,30 @@ class RealtimeScoringServer:
 
                 # ── Challenge verification (POST from JS challenge page) ──
                 if original_uri == self.config["CHALLENGE_PATH"]:
-                    response = self._handle_challenge_verification(ip, headers, parsed)
+                    cr = self._challenge_rate.record(ip, time.time())
+                    if cr > self._challenge_rate_limit:
+                        self.logger.warning(f"[CHALLENGE_RATELIMIT] {ip} {cr} attempts/60s")
+                        response = HTTPParser.build_response(
+                            429, headers={"Retry-After": "60"},
+                            body='{"error":"too_many_attempts","retry_after":60}',
+                        )
+                    else:
+                        response = self._handle_challenge_verification(ip, headers, parsed)
                     writer.write(response)
                     await writer.drain()
                     return
 
                 # ── Biometric captcha verification ──
                 if original_uri == self.config.get("CAPTCHA_PATH", "/_bot_captcha"):
-                    response = self._handle_captcha_verification(ip, parsed)
+                    cr = self._challenge_rate.record(ip, time.time())
+                    if cr > self._challenge_rate_limit:
+                        self.logger.warning(f"[CAPTCHA_RATELIMIT] {ip} {cr} attempts/60s")
+                        response = HTTPParser.build_response(
+                            429, headers={"Retry-After": "60"},
+                            body='{"error":"too_many_attempts","retry_after":60}',
+                        )
+                    else:
+                        response = self._handle_captcha_verification(ip, parsed)
                     writer.write(response)
                     await writer.drain()
                     return
@@ -754,6 +777,58 @@ class RealtimeScoringServer:
             return 429, "rate_limit"
 
         return 200, "allow"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Health check
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _deep_health_check(self) -> dict:
+        """Verify engine, DB, and ML model are functional."""
+        checks: dict[str, str] = {}
+        ok = True
+
+        # Engine loaded
+        checks["engine"] = "ok" if self.engine else "missing"
+        if not self.engine:
+            ok = False
+
+        # Engine can score (dry run)
+        try:
+            from bot_engine import RequestSignals
+            dummy = RequestSignals(ip="127.0.0.1", timestamp=time.time())
+            self.engine.evaluate(dummy)
+            checks["scoring"] = "ok"
+        except Exception as e:
+            checks["scoring"] = f"error: {e}"
+            ok = False
+
+        # SQLite DB accessible
+        try:
+            db = ScoreDatabase(self.config["DB_PATH"])
+            db.conn.execute("SELECT 1")
+            db.close()
+            checks["database"] = "ok"
+        except Exception as e:
+            checks["database"] = f"error: {e}"
+            ok = False
+
+        # ONNX model
+        if self.engine.ml_scorer.is_available:
+            checks["ml_model"] = "ok"
+        else:
+            checks["ml_model"] = "not_loaded"
+            # Not a failure — ML is optional
+
+        # PoW engine
+        checks["pow_engine"] = "ok" if self.pow_engine else "not_loaded"
+
+        # Tracked IPs
+        checks["tracked_ips"] = str(len(self.engine.scores))
+
+        return {
+            "status": "ok" if ok else "degraded",
+            "checks": checks,
+        }
 
     # ──────────────────────────────────────────────────────────────────────────
     # Response builders

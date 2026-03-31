@@ -91,10 +91,10 @@ POW_CONFIG = {
     "MAX_ATTEMPTS_PER_IP": 5,       # Max solve attempts before hard-block
 
     # ── HMAC secret for challenge signing ──
-    "HMAC_SECRET": os.environ.get(
-        "BOT_HMAC_SECRET",
-        "CHANGE_ME_IN_PRODUCTION_" + secrets.token_hex(16)
-    ),
+    # MUST be set via BOT_HMAC_SECRET env var in production.
+    # Generate: python3 -c "import secrets; print(secrets.token_hex(32))"
+    # Fallback auto-generates and persists to disk so it survives restarts.
+    "HMAC_SECRET": os.environ.get("BOT_HMAC_SECRET", ""),
 
     # ── Telemetry collection time ──
     "TELEMETRY_COLLECT_MS": 3000,   # Collect mouse/env data for 3 seconds
@@ -185,12 +185,33 @@ class ProofOfWorkEngine:
 
     def __init__(self, config: dict | None = None):
         self.config = config or POW_CONFIG
-        self.secret = self.config["HMAC_SECRET"].encode()
+        self.secret = self._resolve_secret(self.config["HMAC_SECRET"])
 
         # ── State ──
         self.pending: dict[str, MultiBatchChallenge] = {}
         self.verified: dict[str, VerifiedSession] = {}
         self.attempts: dict[str, int] = {}
+
+    @staticmethod
+    def _resolve_secret(configured: str) -> bytes:
+        """Resolve HMAC secret: env var > persisted file > generate + persist."""
+        if configured:
+            return configured.encode()
+        # Auto-generate and persist so it survives restarts
+        secret_path = Path("/var/lib/bot-engine/.hmac_secret")
+        try:
+            if secret_path.is_file():
+                return secret_path.read_text().strip().encode()
+        except OSError:
+            pass
+        new_secret = secrets.token_hex(32)
+        try:
+            secret_path.parent.mkdir(parents=True, exist_ok=True)
+            secret_path.write_text(new_secret)
+            secret_path.chmod(0o600)
+        except OSError:
+            pass  # Can't persist — secret will change on restart
+        return new_secret.encode()
 
     # ── helpers ──
 
@@ -983,7 +1004,7 @@ class BiometricCaptcha:
 
     def __init__(self, config: dict | None = None):
         self.config = config or POW_CONFIG
-        self.secret = self.config["HMAC_SECRET"].encode()
+        self.secret = ProofOfWorkEngine._resolve_secret(self.config["HMAC_SECRET"])
         # captcha_id -> curve params
         self._pending: dict[str, dict] = {}
 

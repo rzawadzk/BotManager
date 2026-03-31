@@ -29,6 +29,12 @@ RuntimeDirectoryMode=0755
 StateDirectory=bot-engine
 StateDirectoryMode=0750
 
+# Logging — journald by default; set StandardOutput=file: for file-based logging
+# StandardOutput=append:/var/log/bot-engine/scoring.log
+# StandardError=append:/var/log/bot-engine/scoring.log
+LogsDirectory=bot-engine
+LogsDirectoryMode=0750
+
 # Security hardening
 ProtectSystem=strict
 ReadWritePaths=/var/lib/bot-engine /var/log/bot-engine /run/bot-engine /etc/nginx/conf.d
