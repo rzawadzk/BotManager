@@ -112,6 +112,18 @@ class TestSessionTracker:
         drift = tracker.identity_drift("10.0.0.1")
         assert drift >= 2.0  # 3 UAs - 1 baseline = 2 drift
 
+    def test_lru_eviction_at_capacity(self):
+        tracker = SessionTracker(window_seconds=60, max_ips=10)
+        now = time.time()
+        # Fill to capacity
+        for i in range(10):
+            tracker.update(RequestSignals(ip=f"10.0.0.{i}", timestamp=now + i))
+        assert len(tracker._sessions) == 10
+        # Adding one more should trigger LRU eviction
+        tracker.update(RequestSignals(ip="10.0.0.99", timestamp=now + 20))
+        assert len(tracker._sessions) <= 10
+        assert "10.0.0.99" in tracker._sessions
+
     def test_evict_expired(self):
         tracker = SessionTracker(window_seconds=10)
         old = time.time() - 20

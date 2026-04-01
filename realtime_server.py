@@ -1018,13 +1018,14 @@ class RealtimeScoringServer:
                     if t.total_score > 0
                 ]
                 if to_save:
-                    saved = db.save_scores_batch(to_save)
+                    saved = await asyncio.to_thread(db.save_scores_batch, to_save)
                     self.logger.info(f"[SNAPSHOT] Saved {saved} scores to DB")
 
-                # Update Nginx blocklist
+                # Update Nginx blocklist (also I/O-bound)
                 blocklist = self.engine.get_aggregated_blocklist()
                 if blocklist:
-                    BlocklistWriter.write_nginx_deny(
+                    await asyncio.to_thread(
+                        BlocklistWriter.write_nginx_deny,
                         blocklist, CONFIG.get(
                             "BLOCKLIST_OUTPUT",
                             "/etc/nginx/conf.d/dynamic_blocklist.conf"

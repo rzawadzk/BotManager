@@ -31,7 +31,8 @@ import sqlite3
 import statistics
 import time
 import threading
-from collections import defaultdict
+from bisect import bisect_left
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -591,11 +592,12 @@ class MLScorer:
 @dataclass
 class _SessionRecord:
     """Internal record for a single IP's session data."""
-    timestamps: list[float] = field(default_factory=list)
-    paths: list[str] = field(default_factory=list)
+    timestamps: deque = field(default_factory=deque)
+    paths: deque = field(default_factory=deque)
     user_agents: set[str] = field(default_factory=set)
     ja4_hashes: set[str] = field(default_factory=set)
     cookies: set[str] = field(default_factory=set)
+    last_access: float = 0.0  # For LRU eviction
 
 
 class SessionTracker:
@@ -604,29 +606,47 @@ class SessionTracker:
 
     Computes temporal jitter (Inter-Arrival Jitter) and identity drift
     to detect metronomic bots and identity-rotating scrapers.
+
+    Hard-capped at ``max_ips`` tracked sessions. When the cap is hit,
+    the least-recently-accessed sessions are evicted first (LRU).
+    Uses ``collections.deque`` and ``bisect`` for O(log N) eviction.
     """
 
-    def __init__(self, window_seconds: int = CONFIG["SESSION_WINDOW_SECONDS"]) -> None:
+    DEFAULT_MAX_IPS = 200_000
+
+    def __init__(
+        self,
+        window_seconds: int = CONFIG["SESSION_WINDOW_SECONDS"],
+        max_ips: int = DEFAULT_MAX_IPS,
+    ) -> None:
         self._window = window_seconds
+        self._max_ips = max_ips
         self._sessions: dict[str, _SessionRecord] = {}
         self._lock = threading.Lock()
 
     def _evict(self, record: _SessionRecord, now: float) -> None:
-        """Remove entries older than the rolling window."""
+        """Remove entries older than the rolling window using bisect (O(log N))."""
         cutoff = now - self._window
-        # Find the index of the first non-expired timestamp
-        idx = 0
-        for i, ts in enumerate(record.timestamps):
-            if ts >= cutoff:
-                idx = i
-                break
-        else:
-            # All expired
-            idx = len(record.timestamps)
+        ts = record.timestamps
+        if not ts or ts[0] >= cutoff:
+            return
+        # bisect_left finds first index >= cutoff
+        idx = bisect_left(ts, cutoff)
+        # Pop expired entries from the left of both deques
+        for _ in range(idx):
+            ts.popleft()
+            record.paths.popleft()
 
-        if idx > 0:
-            record.timestamps = record.timestamps[idx:]
-            record.paths = record.paths[idx:]
+    def _lru_evict(self, count: int) -> None:
+        """Evict the ``count`` least-recently-accessed sessions (must hold lock)."""
+        if count <= 0:
+            return
+        # Sort IPs by last_access ascending (oldest first)
+        by_age = sorted(
+            self._sessions.items(), key=lambda kv: kv[1].last_access
+        )
+        for ip, _rec in by_age[:count]:
+            del self._sessions[ip]
 
     def update(self, req: RequestSignals) -> str:
         """
@@ -639,6 +659,9 @@ class SessionTracker:
 
         with self._lock:
             if ip not in self._sessions:
+                # Enforce hard cap — evict LRU entries if at capacity
+                if len(self._sessions) >= self._max_ips:
+                    self._lru_evict(max(1, self._max_ips // 20))  # evict 5%
                 self._sessions[ip] = _SessionRecord()
 
             rec = self._sessions[ip]
@@ -646,6 +669,7 @@ class SessionTracker:
 
             rec.timestamps.append(now)
             rec.paths.append(req.path)
+            rec.last_access = now
             if req.user_agent:
                 rec.user_agents.add(req.user_agent)
             if req.ja4_hash:

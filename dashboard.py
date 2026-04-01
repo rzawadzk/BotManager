@@ -61,6 +61,39 @@ def _ip_allowed(client_ip: str) -> bool:
     return any(addr in net for net in DASHBOARD_ALLOW_NETS)
 
 
+# ── Login brute-force rate limiter ──
+# Tracks failed auth attempts per IP. Blocks after MAX_FAILED attempts
+# within WINDOW seconds.
+_AUTH_FAIL_WINDOW = 300   # 5 minutes
+_AUTH_FAIL_MAX = 5        # max failures before lockout
+_auth_failures: dict[str, list[float]] = {}
+
+
+def _check_auth_rate_limit(client_ip: str) -> bool:
+    """Return True if the IP is rate-limited (too many failed auth attempts)."""
+    now = time.time()
+    cutoff = now - _AUTH_FAIL_WINDOW
+    attempts = _auth_failures.get(client_ip, [])
+    # Prune old entries
+    attempts = [t for t in attempts if t > cutoff]
+    _auth_failures[client_ip] = attempts
+    return len(attempts) >= _AUTH_FAIL_MAX
+
+
+def _record_auth_failure(client_ip: str) -> None:
+    """Record a failed authentication attempt for an IP."""
+    now = time.time()
+    if client_ip not in _auth_failures:
+        _auth_failures[client_ip] = []
+    _auth_failures[client_ip].append(now)
+    # Cap stored entries per IP
+    if len(_auth_failures[client_ip]) > _AUTH_FAIL_MAX * 3:
+        cutoff = now - _AUTH_FAIL_WINDOW
+        _auth_failures[client_ip] = [
+            t for t in _auth_failures[client_ip] if t > cutoff
+        ]
+
+
 def _verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     """Validate basic auth credentials with constant-time comparison."""
     user_ok = hmac.compare_digest(credentials.username.encode(), DASHBOARD_USER.encode())
@@ -439,6 +472,14 @@ async def auth_middleware(request: Request, call_next):
     if not _ip_allowed(client_ip):
         return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
+    # Brute-force rate limit check
+    if _check_auth_rate_limit(client_ip):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many failed login attempts. Try again later."},
+            headers={"Retry-After": str(_AUTH_FAIL_WINDOW)},
+        )
+
     import base64
     auth_header = request.headers.get("authorization", "")
     if not auth_header.startswith("Basic "):
@@ -450,6 +491,7 @@ async def auth_middleware(request: Request, call_next):
         decoded = base64.b64decode(auth_header[6:]).decode()
         username, password = decoded.split(":", 1)
     except Exception:
+        _record_auth_failure(client_ip)
         return JSONResponse(
             status_code=401, content={"detail": "Invalid credentials"},
             headers={"WWW-Authenticate": "Basic"},
@@ -457,6 +499,7 @@ async def auth_middleware(request: Request, call_next):
     user_ok = hmac.compare_digest(username.encode(), DASHBOARD_USER.encode())
     pass_ok = hmac.compare_digest(password.encode(), DASHBOARD_PASS.encode())
     if not (user_ok and pass_ok):
+        _record_auth_failure(client_ip)
         return JSONResponse(
             status_code=401, content={"detail": "Invalid credentials"},
             headers={"WWW-Authenticate": "Basic"},
