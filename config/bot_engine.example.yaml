@@ -1,0 +1,38 @@
+# Bot Engine v2.1 — Example Configuration
+# Copy to /etc/bot-engine/config.yaml and customize.
+# All keys map directly to CONFIG entries in bot_engine.py.
+# Only include keys you want to override; defaults apply for the rest.
+
+# ── Thresholds ──
+BLOCK_THRESHOLD: 70
+SUSPECT_THRESHOLD: 40
+BURST_MAX_REQUESTS: 15
+
+# ── Persistence ──
+# DB_PATH: /var/lib/bot-engine/bot_scores.db
+# BLOCKLIST_OUTPUT: /etc/nginx/conf.d/dynamic_blocklist.conf
+
+# ── ML / ONNX ──
+# ONNX_MODEL_PATH: /var/lib/bot-engine/bot_model.onnx
+
+# ── drDNS ──
+DRDNS_CACHE_TTL: 3600
+
+# ── Session Tracking ──
+SESSION_WINDOW_SECONDS: 300
+
+# ── Honeypot / Deception ──
+HONEYPOT_PATHS:
+  - /api/v2/internal/users
+  - /admin/export.csv
+  - /backup/db.sql
+  - /.env
+  - /wp-admin/setup-config.php
+  - /debug/vars
+  - /server-status
+
+# ── Drip Challenge ──
+DRIP_CHALLENGE_DELAY_MS: 150
+
+# ── Agentic AI ──
+MICRO_JITTER_THRESHOLD: 0.02

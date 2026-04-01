@@ -91,7 +91,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from bot_engine import (
         BotScoringEngine, RequestSignals, ThreatScore, ScoreDatabase,
-        BlocklistWriter, CONFIG, GOOD_BOT_UAS,
+        BlocklistWriter, CONFIG, GOOD_BOT_UAS, load_config_file,
     )
 except ImportError:
     print("ERROR: bot_engine.py must be in the same directory or on PYTHONPATH")
@@ -222,6 +222,41 @@ class Metrics:
             "uvloop": UVLOOP_AVAILABLE,
             "pow_available": POW_AVAILABLE,
         }
+
+    def prometheus_text(self) -> str:
+        """Return metrics in Prometheus text exposition format."""
+        elapsed = time.monotonic() - self._start_time
+        avg_latency = (
+            self.latency_sum_us / self.latency_count
+            if self.latency_count > 0 else 0
+        )
+        lines = [
+            "# HELP bot_engine_requests_total Total requests processed.",
+            "# TYPE bot_engine_requests_total counter",
+            f"bot_engine_requests_total {self.requests_total}",
+            "# HELP bot_engine_requests Requests by decision.",
+            "# TYPE bot_engine_requests counter",
+            f'bot_engine_requests{{decision="allow"}} {self.requests_allowed}',
+            f'bot_engine_requests{{decision="block"}} {self.requests_blocked}',
+            f'bot_engine_requests{{decision="rate_limit"}} {self.requests_rate_limited}',
+            f'bot_engine_requests{{decision="challenge"}} {self.requests_challenged}',
+            f'bot_engine_requests{{decision="api_reject"}} {self.requests_api_rejected}',
+            f'bot_engine_requests{{decision="honeypot"}} {self.requests_honeypot}',
+            f'bot_engine_requests{{decision="whitelist"}} {self.requests_whitelisted}',
+            "# HELP bot_engine_errors_total Total processing errors.",
+            "# TYPE bot_engine_errors_total counter",
+            f"bot_engine_errors_total {self.requests_errors}",
+            "# HELP bot_engine_latency_avg_us Average scoring latency in microseconds.",
+            "# TYPE bot_engine_latency_avg_us gauge",
+            f"bot_engine_latency_avg_us {avg_latency:.1f}",
+            "# HELP bot_engine_latency_max_us Maximum scoring latency in microseconds.",
+            "# TYPE bot_engine_latency_max_us gauge",
+            f"bot_engine_latency_max_us {self.latency_max_us}",
+            "# HELP bot_engine_uptime_seconds Server uptime in seconds.",
+            "# TYPE bot_engine_uptime_seconds gauge",
+            f"bot_engine_uptime_seconds {int(elapsed)}",
+        ]
+        return "\n".join(lines) + "\n"
 
     def reset_latency(self):
         self.latency_sum_us = 0
@@ -569,10 +604,24 @@ class RealtimeScoringServer:
                 if original_uri == "/_bot_stats":
                     stats = self.metrics.snapshot()
                     stats["engine_tracked_ips"] = len(self.engine.scores)
+                    if self.engine.ml_scorer.is_available:
+                        stats["ml_staleness"] = self.engine.ml_scorer.staleness_report()
                     if self.pow_engine:
                         stats["pow_stats"] = self.pow_engine.get_stats()
                     response = HTTPParser.build_response(
                         200, body=json.dumps(stats)
+                    )
+                    writer.write(response)
+                    await writer.drain()
+                    return
+
+                # ── Prometheus metrics endpoint ──
+                if original_uri == "/_metrics":
+                    body = self.metrics.prometheus_text()
+                    response = HTTPParser.build_response(
+                        200,
+                        headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+                        body=body,
                     )
                     writer.write(response)
                     await writer.drain()
@@ -812,9 +861,13 @@ class RealtimeScoringServer:
             checks["database"] = f"error: {e}"
             ok = False
 
-        # ONNX model
+        # ONNX model + staleness
         if self.engine.ml_scorer.is_available:
+            staleness = self.engine.ml_scorer.staleness_report()
             checks["ml_model"] = "ok"
+            checks["ml_staleness"] = staleness
+            if staleness.get("stale") or staleness.get("drift_detected"):
+                checks["ml_model"] = "stale_or_drifted"
         else:
             checks["ml_model"] = "not_loaded"
             # Not a failure — ML is optional
@@ -1095,8 +1148,13 @@ Examples:
                         help="TCP port (used with --host)")
     parser.add_argument("--whitelist", type=str, default="",
                         help="Comma-separated IPs to whitelist")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML or TOML config file")
 
     args = parser.parse_args()
+
+    if args.config:
+        load_config_file(args.config)
 
     if args.whitelist:
         SERVER_CONFIG["WHITELIST_IPS"].update(

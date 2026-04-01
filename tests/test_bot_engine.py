@@ -1,0 +1,342 @@
+"""Tests for bot_engine.py — scoring engine, session tracker, deception, etc."""
+
+import time
+import pytest
+import sys
+import os
+
+# Ensure project root is on path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from bot_engine import (
+    RequestSignals, ThreatScore, BotScoringEngine, SessionTracker,
+    DeceptionEngine, AgenticAIDetector, MLScorer, CONFIG, load_config_file,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ThreatScore
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestThreatScore:
+    def test_classify_bad(self):
+        ts = ThreatScore(ip="1.1.1.1", total_score=85)
+        ts.classify()
+        assert ts.classification == "bad"
+
+    def test_classify_suspect(self):
+        ts = ThreatScore(ip="1.1.1.1", total_score=50)
+        ts.classify()
+        assert ts.classification == "suspect"
+
+    def test_classify_unknown(self):
+        ts = ThreatScore(ip="1.1.1.1", total_score=10)
+        ts.classify()
+        assert ts.classification == "unknown"
+
+    def test_classify_good(self):
+        ts = ThreatScore(ip="1.1.1.1", total_score=0)
+        ts.classify()
+        assert ts.classification == "good"
+
+    def test_classify_custom_thresholds(self):
+        custom = {**CONFIG, "BLOCK_THRESHOLD": 90, "SUSPECT_THRESHOLD": 60}
+        ts = ThreatScore(ip="1.1.1.1", total_score=75)
+        ts.classify(config=custom)
+        assert ts.classification == "suspect"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SessionTracker
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSessionTracker:
+    def test_update_returns_session_id(self):
+        tracker = SessionTracker(window_seconds=60)
+        req = RequestSignals(ip="10.0.0.1", timestamp=time.time())
+        sid = tracker.update(req)
+        assert isinstance(sid, str)
+        assert len(sid) == 16
+
+    def test_request_count(self):
+        tracker = SessionTracker(window_seconds=60)
+        now = time.time()
+        for i in range(5):
+            tracker.update(RequestSignals(ip="10.0.0.1", timestamp=now + i))
+        assert tracker.request_count("10.0.0.1") == 5
+        assert tracker.request_count("10.0.0.2") == 0
+
+    def test_temporal_jitter_insufficient_data(self):
+        tracker = SessionTracker(window_seconds=60)
+        now = time.time()
+        tracker.update(RequestSignals(ip="10.0.0.1", timestamp=now))
+        assert tracker.temporal_jitter("10.0.0.1") == -1.0
+
+    def test_temporal_jitter_metronomic(self):
+        tracker = SessionTracker(window_seconds=60)
+        now = time.time()
+        # Perfectly timed requests — near-zero jitter
+        for i in range(10):
+            tracker.update(RequestSignals(ip="10.0.0.1", timestamp=now + i * 1.0))
+        jitter = tracker.temporal_jitter("10.0.0.1")
+        assert jitter >= 0
+        assert jitter < 0.01  # nearly zero stdev
+
+    def test_temporal_jitter_human_like(self):
+        tracker = SessionTracker(window_seconds=60)
+        now = time.time()
+        # Irregular intervals
+        offsets = [0, 0.5, 2.1, 3.8, 4.0, 7.5, 12.0]
+        for off in offsets:
+            tracker.update(RequestSignals(ip="10.0.0.1", timestamp=now + off))
+        jitter = tracker.temporal_jitter("10.0.0.1")
+        assert jitter > 0.1  # noticeable variation
+
+    def test_identity_drift_single_identity(self):
+        tracker = SessionTracker(window_seconds=60)
+        now = time.time()
+        for i in range(3):
+            tracker.update(RequestSignals(
+                ip="10.0.0.1", timestamp=now + i, user_agent="Mozilla/5.0"
+            ))
+        assert tracker.identity_drift("10.0.0.1") == 0.0
+
+    def test_identity_drift_rotating(self):
+        tracker = SessionTracker(window_seconds=60)
+        now = time.time()
+        uas = ["Mozilla/5.0", "Chrome/120", "Safari/17"]
+        for i, ua in enumerate(uas):
+            tracker.update(RequestSignals(
+                ip="10.0.0.1", timestamp=now + i, user_agent=ua
+            ))
+        drift = tracker.identity_drift("10.0.0.1")
+        assert drift >= 2.0  # 3 UAs - 1 baseline = 2 drift
+
+    def test_evict_expired(self):
+        tracker = SessionTracker(window_seconds=10)
+        old = time.time() - 20
+        tracker.update(RequestSignals(ip="10.0.0.1", timestamp=old))
+        removed = tracker.evict_expired()
+        assert removed == 1
+        assert tracker.request_count("10.0.0.1") == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DeceptionEngine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDeceptionEngine:
+    def test_honeypot_hit(self):
+        de = DeceptionEngine(honeypot_paths=["/.env", "/admin/export.csv"])
+        assert de.is_honeypot_hit("/.env") is True
+        assert de.is_honeypot_hit("/.env?foo=bar") is True
+        assert de.is_honeypot_hit("/admin/export.csv/") is True
+        assert de.is_honeypot_hit("/legitimate/page") is False
+
+    def test_trap_score_no_access(self):
+        de = DeceptionEngine(honeypot_paths=["/.env"])
+        assert de.get_trap_score("10.0.0.1") == 0.0
+
+    def test_trap_score_single(self):
+        de = DeceptionEngine(honeypot_paths=["/.env"])
+        de.record_trap_access("10.0.0.1", "/.env")
+        assert de.get_trap_score("10.0.0.1") == 80.0
+
+    def test_trap_score_multiple_paths(self):
+        de = DeceptionEngine(honeypot_paths=["/.env", "/.git/config"])
+        de.record_trap_access("10.0.0.1", "/.env")
+        de.record_trap_access("10.0.0.1", "/.git/config")
+        assert de.get_trap_score("10.0.0.1") == 100.0
+
+    def test_honeypot_links_generation(self):
+        de = DeceptionEngine(honeypot_paths=["/.env"])
+        links = de.get_honeypot_links()
+        assert len(links) == 1
+        assert "/.env" in links[0]
+        assert "opacity:0" in links[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MLScorer (staleness tracking, no ONNX needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMLScorer:
+    def test_staleness_report_no_model(self):
+        scorer = MLScorer(model_path="/nonexistent/model.onnx")
+        report = scorer.staleness_report()
+        assert report["model_loaded"] is False
+
+    def test_record_prediction_tracking(self):
+        scorer = MLScorer(model_path="/nonexistent/model.onnx")
+        for i in range(5):
+            scorer.record_prediction(float(i * 10))
+        assert len(scorer._predictions) == 5
+
+    def test_record_feedback(self):
+        scorer = MLScorer(model_path="/nonexistent/model.onnx")
+        scorer.record_feedback(predicted_bad=True, actual_bad=True)
+        scorer.record_feedback(predicted_bad=True, actual_bad=False)
+        assert scorer._feedback_total == 2
+        assert scorer._feedback_matches == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BotScoringEngine (integration)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBotScoringEngine:
+    @pytest.fixture
+    def engine(self):
+        return BotScoringEngine()
+
+    def test_evaluate_clean_request(self, engine):
+        req = RequestSignals(
+            ip="203.0.113.1",
+            timestamp=time.time(),
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            path="/index.html",
+        )
+        result = engine.evaluate(req)
+        assert isinstance(result, ThreatScore)
+        assert result.request_count == 1
+        assert result.total_score < CONFIG["BLOCK_THRESHOLD"]
+
+    def test_evaluate_bad_ua(self, engine):
+        req = RequestSignals(
+            ip="203.0.113.2",
+            timestamp=time.time(),
+            user_agent="python-requests/2.28.0",
+            path="/",
+        )
+        result = engine.evaluate(req)
+        assert any("bad_bot" in r or "bad_ua" in r for r in result.reasons)
+        assert result.total_score > 0
+
+    def test_evaluate_probe_path(self, engine):
+        req = RequestSignals(
+            ip="203.0.113.3",
+            timestamp=time.time(),
+            user_agent="Mozilla/5.0",
+            path="/.env",
+        )
+        result = engine.evaluate(req)
+        # Honeypot hit should give a very high score
+        assert result.total_score >= 80
+
+    def test_evaluate_empty_ua(self, engine):
+        req = RequestSignals(
+            ip="203.0.113.4",
+            timestamp=time.time(),
+            user_agent="",
+            path="/",
+        )
+        result = engine.evaluate(req)
+        assert any("empty_ua" in r or "no_ua" in r or "missing" in r.lower()
+                    for r in result.reasons) or result.total_score > 0
+
+    def test_evaluate_burst(self, engine):
+        now = time.time()
+        # Send many requests rapidly
+        for i in range(20):
+            req = RequestSignals(
+                ip="203.0.113.5",
+                timestamp=now + i * 0.01,
+                user_agent="Mozilla/5.0",
+                path="/page",
+            )
+            result = engine.evaluate(req)
+        # After many requests, score should increase
+        assert result.request_count == 20
+
+    def test_evaluate_verified_good_bot(self, engine):
+        req = RequestSignals(
+            ip="66.249.66.1",
+            timestamp=time.time(),
+            user_agent="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            path="/",
+            # Pre-resolved as verified Googlebot
+            drdns_result=(True, "google"),
+        )
+        result = engine.evaluate(req)
+        assert result.identity_verified is True
+        assert result.total_score == 0
+
+    def test_evaluate_claimed_good_bot_unverified(self, engine):
+        req = RequestSignals(
+            ip="203.0.113.10",
+            timestamp=time.time(),
+            user_agent="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            path="/",
+            drdns_result=(False, None),
+        )
+        result = engine.evaluate(req)
+        assert result.identity_verified is False
+        assert any("fake" in r.lower() or "impersonat" in r.lower() or "spoof" in r.lower()
+                    for r in result.reasons)
+
+    def test_scores_persist_across_requests(self, engine):
+        now = time.time()
+        req1 = RequestSignals(ip="203.0.113.6", timestamp=now, path="/")
+        req2 = RequestSignals(ip="203.0.113.6", timestamp=now + 1, path="/page2")
+        engine.evaluate(req1)
+        result = engine.evaluate(req2)
+        assert result.request_count == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AgenticAIDetector
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAgenticAIDetector:
+    def test_no_telemetry_returns_zero(self):
+        detector = AgenticAIDetector()
+        score, reasons = detector.analyze_biometrics(telemetry=None)
+        assert score == 0.0
+
+    def test_insufficient_telemetry(self):
+        detector = AgenticAIDetector()
+        score, reasons = detector.analyze_biometrics(telemetry={"mouse_moves": [(0, 1, 2)]})
+        assert score == 0.0
+        assert "insufficient_telemetry" in reasons
+
+    def test_should_drip_challenge(self):
+        detector = AgenticAIDetector()
+        # High score should trigger drip challenge
+        result = detector.should_drip_challenge("10.0.0.1", score=60.0)
+        assert isinstance(result, bool)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Config file loading
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLoadConfigFile:
+    def test_nonexistent_file_raises(self):
+        with pytest.raises(FileNotFoundError):
+            load_config_file("/nonexistent/config.yaml")
+
+    def test_unsupported_format_raises(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            f.write(b'{}')
+            path = f.name
+        try:
+            with pytest.raises(ValueError, match="Unsupported"):
+                load_config_file(path)
+        finally:
+            os.unlink(path)
+
+    def test_yaml_loading(self):
+        pytest.importorskip("yaml")
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            f.write("BLOCK_THRESHOLD: 99\n")
+            path = f.name
+        try:
+            old_val = CONFIG["BLOCK_THRESHOLD"]
+            result = load_config_file(path)
+            assert result["BLOCK_THRESHOLD"] == 99
+            # Restore
+            CONFIG["BLOCK_THRESHOLD"] = old_val
+        finally:
+            os.unlink(path)

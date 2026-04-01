@@ -98,6 +98,35 @@ CONFIG = {
 }
 
 
+def load_config_file(path: str) -> dict:
+    """Load a YAML or TOML config file and merge into CONFIG.
+
+    Returns the merged config dict. Supports .yaml/.yml and .toml extensions.
+    Unknown keys are silently accepted to allow forward-compatible config files.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    suffix = p.suffix.lower()
+    if suffix in (".yaml", ".yml"):
+        import yaml  # type: ignore[import-untyped]
+        with open(p) as f:
+            user_config = yaml.safe_load(f) or {}
+    elif suffix == ".toml":
+        import tomllib  # Python 3.11+
+        with open(p, "rb") as f:
+            user_config = tomllib.load(f)
+    else:
+        raise ValueError(f"Unsupported config format '{suffix}'. Use .yaml, .yml, or .toml")
+
+    if not isinstance(user_config, dict):
+        raise ValueError("Config file must contain a top-level mapping")
+
+    CONFIG.update(user_config)
+    return CONFIG
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA CLASSES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -351,10 +380,24 @@ class MLScorer:
 
     N_FEATURES = 16
 
+    # ── Staleness thresholds ──
+    MAX_MODEL_AGE_DAYS = 30       # Flag if model file older than this
+    DRIFT_WINDOW = 1000           # Rolling window size for prediction stats
+    DRIFT_THRESHOLD = 0.15        # Flag if mean prediction shifts by this much
+
     def __init__(self, model_path: str = CONFIG["ONNX_MODEL_PATH"]) -> None:
         self._session: object | None = None
         self._input_name: str = ""
         self._available = False
+        self._model_path = model_path
+        self._model_loaded_at: float = 0.0
+        self._model_file_mtime: float = 0.0
+
+        # Staleness tracking: rolling prediction distribution
+        self._predictions: list[float] = []
+        self._baseline_mean: float | None = None
+        self._feedback_matches = 0
+        self._feedback_total = 0
 
         if not _ONNX_AVAILABLE:
             return
@@ -368,6 +411,8 @@ class MLScorer:
             )
             self._input_name = self._session.get_inputs()[0].name
             self._available = True
+            self._model_loaded_at = time.time()
+            self._model_file_mtime = os.path.getmtime(model_path)
         except Exception:
             self._session = None
 
@@ -375,6 +420,74 @@ class MLScorer:
     def is_available(self) -> bool:
         """Whether the ML model is loaded and ready for inference."""
         return self._available
+
+    def staleness_report(self) -> dict:
+        """
+        Return a staleness diagnostic for the current ML model.
+
+        Checks:
+          - model_age_days: how old the model file is
+          - prediction_drift: whether the rolling mean prediction has shifted
+            significantly from the baseline (first DRIFT_WINDOW predictions)
+          - feedback_accuracy: if human feedback has been provided, what fraction
+            of predictions agreed with the human label
+          - needs_retrain: True if any staleness indicator is triggered
+        """
+        report: dict = {
+            "model_loaded": self._available,
+            "model_age_days": 0.0,
+            "prediction_drift": 0.0,
+            "feedback_accuracy": None,
+            "needs_retrain": False,
+            "reasons": [],
+        }
+
+        if not self._available:
+            report["reasons"].append("no_model_loaded")
+            return report
+
+        # Model age
+        age_days = (time.time() - self._model_file_mtime) / 86400
+        report["model_age_days"] = round(age_days, 1)
+        if age_days > self.MAX_MODEL_AGE_DAYS:
+            report["needs_retrain"] = True
+            report["reasons"].append(f"model_age_{age_days:.0f}d")
+
+        # Prediction drift
+        if len(self._predictions) >= self.DRIFT_WINDOW:
+            if self._baseline_mean is not None:
+                current_mean = sum(self._predictions[-self.DRIFT_WINDOW:]) / self.DRIFT_WINDOW
+                drift = abs(current_mean - self._baseline_mean)
+                report["prediction_drift"] = round(drift, 4)
+                if drift > self.DRIFT_THRESHOLD:
+                    report["needs_retrain"] = True
+                    report["reasons"].append(f"prediction_drift_{drift:.3f}")
+
+        # Feedback accuracy
+        if self._feedback_total >= 20:
+            accuracy = self._feedback_matches / self._feedback_total
+            report["feedback_accuracy"] = round(accuracy, 3)
+            if accuracy < 0.7:
+                report["needs_retrain"] = True
+                report["reasons"].append(f"low_feedback_accuracy_{accuracy:.2f}")
+
+        return report
+
+    def record_prediction(self, score: float) -> None:
+        """Track a prediction for drift monitoring."""
+        self._predictions.append(score)
+        # Set baseline from first full window
+        if self._baseline_mean is None and len(self._predictions) == self.DRIFT_WINDOW:
+            self._baseline_mean = sum(self._predictions) / self.DRIFT_WINDOW
+        # Cap memory usage
+        if len(self._predictions) > self.DRIFT_WINDOW * 3:
+            self._predictions = self._predictions[-self.DRIFT_WINDOW * 2:]
+
+    def record_feedback(self, predicted_bad: bool, actual_bad: bool) -> None:
+        """Record human feedback to track prediction accuracy."""
+        self._feedback_total += 1
+        if predicted_bad == actual_bad:
+            self._feedback_matches += 1
 
     @staticmethod
     def _hash_to_int(h: Optional[str]) -> int:
@@ -1023,6 +1136,7 @@ class BotScoringEngine:
         if self.ml_scorer.is_available:
             try:
                 ml_score = self.ml_scorer.predict(req)
+                self.ml_scorer.record_prediction(ml_score)
                 threat.ml_score = ml_score
                 if ml_score > 70:
                     reasons.append("ml_high_score")
