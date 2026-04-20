@@ -65,3 +65,36 @@ AI_CRAWLER_SCORE: 50
 # build a real-traffic dataset for ML retraining and threshold tuning.
 # Look for [LEARN_MODE] log lines to review would-be decisions.
 LEARN_MODE: false
+
+# ── Audience-aware tooling UA policy (P1 #4) ──
+# For sites where tooling clients (curl, python-requests, wget) are
+# legitimately used (security research hubs, docs portals that publish
+# curl snippets), set a discount to apply on non-API paths. Sensitive
+# endpoints listed in ENDPOINT_THRESHOLDS still get the full penalty plus
+# TOOLING_UA_API_BONUS. Leave both at 0 / default to preserve default
+# strictness.
+TOOLING_UA_STATIC_DISCOUNT: 0
+TOOLING_UA_API_BONUS: 35
+
+# ── Canary endpoints (P1 #8) ──
+# Paths referenced only as dead code in the JS bundle (see
+# static/bot_canary.js). Real browsers never request them. Any hit
+# scores 100 and classifies "bad" immediately.
+CANARY_PATHS:
+  - /api/v2/_internal/models_internal
+  - /api/v2/_internal/admin/api_keys
+  - /api/v2/_internal/training/export.jsonl
+  - /api/v2/_internal/users/dump
+
+# ── First-request delay gate (P1 #9) ──
+# Bots going straight to /api/chat without loading the page first get
+# flagged. Set to empty list to disable.
+FIRST_REQUEST_GATE_SECONDS: 2.0
+FIRST_REQUEST_GATE_PATHS:
+  - /api/chat
+
+# ── Prompt injection detection (P1 #5) ──
+# When true, the realtime server exposes POST /_bot_score_body. The LLM
+# proxy backend should call this with the user's prompt BEFORE forwarding
+# to the model, and reject requests with verdict "block".
+PROMPT_INJECTION_ENABLED: true

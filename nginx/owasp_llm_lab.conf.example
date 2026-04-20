@@ -67,8 +67,13 @@ server {
     }
 
     # ── Per-endpoint rate limits (cost protection) ──
+    # Two-tier limit on /api/chat:
+    #   chat_burst:  30/min short bursts (allow a reasonable conversation)
+    #   chat_hourly: 300/hr absolute ceiling (cap per-IP token cost per hour)
+    # nginx applies both; violating either returns 429.
     # Defined in /etc/nginx/conf.d/bot_engine.conf or here:
-    limit_req_zone $binary_remote_addr zone=chat_api:10m rate=30r/m;
+    limit_req_zone $binary_remote_addr zone=chat_burst:10m rate=30r/m;
+    limit_req_zone $binary_remote_addr zone=chat_hourly:10m rate=300r/h;
     limit_req_zone $binary_remote_addr zone=general:10m rate=120r/m;
 
     # ── Static site (index.html, CSS, JS) ──
@@ -95,10 +100,19 @@ server {
         auth_request_set $bot_score  $upstream_http_x_bot_score;
         auth_request_set $bot_action $upstream_http_x_bot_action;
 
-        # Hard rate limit: 30/min, burst 5 (cost protection)
-        limit_req zone=chat_api burst=5 nodelay;
+        # Two-tier cost protection (P1 #6):
+        #   chat_burst:  30/min, burst 5 — handles natural conversation spikes
+        #   chat_hourly: 300/hr, burst 30 — ceiling on per-IP token spend/hr
+        # Violating either returns 429. Both counters are per-IP.
+        limit_req zone=chat_burst  burst=5  nodelay;
+        limit_req zone=chat_hourly burst=30 nodelay;
 
         # Forward to your LLM proxy backend
+        # The backend SHOULD call POST /_bot_score_body on the bot engine's
+        # Unix socket with the raw prompt before invoking the LLM, and
+        # reject requests with verdict="block". This catches prompt
+        # injection / jailbreak attempts that the auth_request path can't
+        # see (nginx auth_request doesn't forward bodies).
         proxy_pass http://127.0.0.1:3001;
         proxy_http_version 1.1;
         proxy_set_header Host             $host;

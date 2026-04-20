@@ -71,3 +71,37 @@ MICRO_JITTER_THRESHOLD: 0.02
 # reviewed the dashboard, labeled ~200 requests, and retrained the ONNX
 # model on your actual traffic mix.
 LEARN_MODE: true
+
+# ── Audience-aware tooling UA policy (P1 #4) ──
+# Researchers routinely share `curl` commands that demonstrate payloads.
+# Discount the bad_bot_ua penalty by 25 on public static paths so those
+# demonstrations don't get false-positive blocked. But if the same UA hits
+# /api/chat, add TOOLING_UA_API_BONUS (70) on top — real chat traffic
+# comes from browsers, never curl.
+TOOLING_UA_STATIC_DISCOUNT: 25
+TOOLING_UA_API_BONUS: 70
+
+# ── Canary endpoints (P1 #8) ──
+# Dead-code references in static/bot_canary.js. A browser never hits these;
+# a JS-scraping bot will, and gets scored 100 immediately.
+CANARY_PATHS:
+  - /api/v2/_internal/models_internal
+  - /api/v2/_internal/admin/api_keys
+  - /api/v2/_internal/training/export.jsonl
+  - /api/v2/_internal/users/dump
+
+# ── First-request delay gate (P1 #9) ──
+# Block the "straight to /api/chat with no cookie, no prior visit" pattern
+# that every headless scraper uses. Real users spend at least 2 seconds
+# reading the vuln description before clicking "ask the bot".
+FIRST_REQUEST_GATE_SECONDS: 2.0
+FIRST_REQUEST_GATE_PATHS:
+  - /api/chat
+
+# ── Prompt injection detection (P1 #5) ──
+# The LLM proxy backend should call POST /_bot_score_body on the bot
+# engine Unix socket with the raw prompt before invoking the model, and
+# reject requests with verdict "block". This catches OWASP LLM01 attacks
+# (jailbreaks, template injection, exfiltration payloads) that nginx
+# auth_request can't see because it doesn't forward bodies.
+PROMPT_INJECTION_ENABLED: true

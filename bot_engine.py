@@ -122,6 +122,41 @@ CONFIG = {
     # collect real-world traffic for ML retraining and threshold tuning
     # before enabling blocking. Can also be set via BOT_LEARN_MODE env var.
     "LEARN_MODE": os.environ.get("BOT_LEARN_MODE", "").lower() in ("1", "true", "yes"),
+
+    # ── Audience-aware tooling UA policy (P1 #4) ──
+    # curl/python-requests/wget are already in BAD_BOT_UAS and get the full
+    # rule-score penalty. For audience-oriented sites (e.g. a security
+    # research hub where researchers routinely share curl commands), the
+    # penalty can be discounted on public static paths and boosted on
+    # sensitive endpoints (anything listed in ENDPOINT_THRESHOLDS — typically
+    # /api/*). Set TOOLING_UA_STATIC_DISCOUNT > 0 to opt in; keep the default
+    # 0 to preserve the engine's default strictness.
+    "TOOLING_UA_STATIC_DISCOUNT": 0,
+    "TOOLING_UA_API_BONUS": 35,
+
+    # ── Canary endpoints (P1 #8) ──
+    # Paths that exist only as dead code in the JS bundle or as bait for
+    # endpoint-enumerating scrapers. A real user's browser never executes
+    # that code path; a bot parsing JS for endpoints will. Any request to a
+    # canary path scores 100 immediately. Separate from HONEYPOT_PATHS so
+    # operators can distinguish scanner traffic (honeypots) from
+    # script-parsing scrapers (canaries) in the dashboard.
+    "CANARY_PATHS": [],
+
+    # ── First-request delay gate (P1 #9) ──
+    # On landing-page → API flows, require at least FIRST_REQUEST_GATE_SECONDS
+    # between the first seen request from an IP and any request to a
+    # path matching FIRST_REQUEST_GATE_PATHS. Bots that hit /api/chat as
+    # their very first request (no cookie, no prior GET /) get penalised.
+    "FIRST_REQUEST_GATE_SECONDS": 2.0,
+    "FIRST_REQUEST_GATE_PATHS": [],
+
+    # ── Prompt injection detection (P1 #5) ──
+    # When true, /_bot_score_body endpoint on the realtime server will
+    # inspect request bodies for jailbreak patterns, hex smuggling, and
+    # length anomalies. Called synchronously by the LLM proxy backend
+    # before forwarding to the model.
+    "PROMPT_INJECTION_ENABLED": True,
 }
 
 
@@ -276,6 +311,17 @@ AI_CRAWLER_UAS = re.compile(
 PROBE_PATHS = re.compile(
     r"(\.env|\.git|wp-admin|wp-login|phpinfo|\.php$|/admin"
     r"|/config|/backup|\.sql|\.bak|/debug|/actuator|/\.)",
+    re.IGNORECASE,
+)
+
+# Tooling UAs — a subset of BAD_BOT_UAS that represents HTTP clients
+# developers and scripts use legitimately on some sites (security research
+# hubs, documentation portals that publish curl-ready snippets, etc).
+# Matched separately so the engine can discount them on public static paths
+# and boost them on sensitive endpoints (ENDPOINT_THRESHOLDS).
+TOOLING_UAS = re.compile(
+    r"(python-requests|python-urllib|curl/|wget/|httpie"
+    r"|Go-http-client|node-fetch|axios|okhttp/)",
     re.IGNORECASE,
 )
 
@@ -668,6 +714,7 @@ class _SessionRecord:
     ja4_hashes: set[str] = field(default_factory=set)
     cookies: set[str] = field(default_factory=set)
     last_access: float = 0.0  # For LRU eviction
+    first_seen: float = 0.0   # For first-request delay gate (P1 #9)
 
 
 class SessionTracker:
@@ -732,7 +779,9 @@ class SessionTracker:
                 # Enforce hard cap — evict LRU entries if at capacity
                 if len(self._sessions) >= self._max_ips:
                     self._lru_evict(max(1, self._max_ips // 20))  # evict 5%
-                self._sessions[ip] = _SessionRecord()
+                rec = _SessionRecord()
+                rec.first_seen = now
+                self._sessions[ip] = rec
 
             rec = self._sessions[ip]
             self._evict(rec, now)
@@ -805,6 +854,26 @@ class SessionTracker:
         with self._lock:
             rec = self._sessions.get(ip)
             return len(rec.timestamps) if rec else 0
+
+    def has_been_seen(self, ip: str) -> bool:
+        """True if this IP already has a session record (seen previously)."""
+        with self._lock:
+            return ip in self._sessions
+
+    def time_since_first_seen(self, ip: str, now: float | None = None) -> float | None:
+        """Seconds since this IP was first recorded; None if never seen.
+
+        Used by the first-request delay gate: if an IP's very first request
+        targets a protected endpoint (no prior browsing), or arrives within
+        a tiny window of that first request, that's a strong bot signal.
+        """
+        if now is None:
+            now = time.time()
+        with self._lock:
+            rec = self._sessions.get(ip)
+            if rec is None or rec.first_seen == 0.0:
+                return None
+            return now - rec.first_seen
 
     def evict_expired(self) -> int:
         """Remove all fully-expired sessions. Returns count removed."""
@@ -1114,6 +1183,109 @@ class DeceptionEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PROMPT INJECTION DETECTOR (P1 #5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PromptInjectionDetector:
+    """
+    Inspect LLM request bodies for prompt-injection / jailbreak patterns.
+
+    Called by the LLM proxy backend via the ``/_bot_score_body`` endpoint on
+    the realtime server, *before* forwarding the prompt to the model. This
+    sits outside the Nginx auth_request path because auth_request cannot
+    read request bodies.
+
+    Returns (score, reasons). The score is intended to be added to the
+    existing ThreatScore for the IP (via a separate /_bot_feedback call) or
+    used by the proxy to reject the request outright.
+
+    The detector is deliberately noisy on obvious attack patterns and
+    cautious on ambiguous ones — the OWASP LLM Top 10 threat model expects
+    operators to tune thresholds with real traffic.
+    """
+
+    # Known jailbreak phrases (case-insensitive). Short list of the most
+    # commonly observed patterns in public jailbreak corpora. Each match
+    # adds a fixed score; multiple matches compound up to a cap.
+    JAILBREAK_PATTERNS = (
+        r"ignore (all |any |the |your )?(previous|prior|above|earlier)\s+(instructions|rules|prompts?|context)",
+        r"disregard (all |any |the |your )?(previous|prior|above)\s+(instructions|rules|prompt)",
+        r"forget (all |any |the |your |everything )?(previous|prior|above|you)",
+        r"DAN mode|developer mode enabled|jailbreak mode",
+        r"you are now (DAN|in developer mode|a different|an? (unrestricted|uncensored))",
+        r"pretend (to be|you are|that you)\s+(not|no longer)",
+        r"simulate (being|a different|an ai (without|with no))",
+        r"(reveal|print|output|show) (your|the) (system prompt|initial prompt|instructions)",
+        r"new (instructions|system prompt|rules):",
+        r"\[INST\]|\<\|im_start\|\>|\<\|system\|\>",  # template-injection
+    )
+
+    # Hex smuggling — long runs of \x?? escapes in what should be plain
+    # user prose. Real humans do not type 8+ consecutive hex escapes.
+    HEX_SMUGGLING = re.compile(r"(\\x[0-9a-fA-F]{2}){8,}")
+
+    # Large base64 blob in a chat prompt — exfiltration or payload-smuggling
+    # signal. 500 chars ~= 375 bytes of binary; unusual in a human prompt.
+    BASE64_BLOB = re.compile(r"[A-Za-z0-9+/]{500,}={0,2}")
+
+    # Control characters (except tab, newline, CR) inside a text prompt
+    CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+    # Length anomaly threshold — most human chat prompts are << 4000 chars
+    LENGTH_ANOMALY = 4000
+
+    # Score weights
+    SCORE_PER_PATTERN = 25.0
+    SCORE_PATTERN_CAP = 60.0
+    SCORE_LENGTH = 15.0
+    SCORE_HEX_SMUGGLING = 30.0
+    SCORE_BASE64_BLOB = 20.0
+    SCORE_CONTROL_CHARS = 20.0
+
+    def __init__(self) -> None:
+        self._patterns = [
+            re.compile(p, re.IGNORECASE | re.DOTALL)
+            for p in self.JAILBREAK_PATTERNS
+        ]
+
+    def score(self, body: str) -> tuple[float, list[str]]:
+        """Return (score, reasons) for a body string. Empty body → (0.0, [])."""
+        reasons: list[str] = []
+        score = 0.0
+
+        if not body:
+            return 0.0, reasons
+
+        # Length anomaly
+        if len(body) > self.LENGTH_ANOMALY:
+            score += self.SCORE_LENGTH
+            reasons.append("prompt_length_anomaly")
+
+        # Jailbreak pattern matches
+        matches = sum(1 for pat in self._patterns if pat.search(body))
+        if matches:
+            score += min(matches * self.SCORE_PER_PATTERN, self.SCORE_PATTERN_CAP)
+            reasons.append(f"jailbreak_patterns:{matches}")
+
+        # Hex smuggling
+        if self.HEX_SMUGGLING.search(body):
+            score += self.SCORE_HEX_SMUGGLING
+            reasons.append("hex_smuggling")
+
+        # Large base64 blob
+        if self.BASE64_BLOB.search(body):
+            score += self.SCORE_BASE64_BLOB
+            reasons.append("base64_blob")
+
+        # Control chars (except tab/newline/CR)
+        if self.CONTROL_CHARS.search(body):
+            score += self.SCORE_CONTROL_CHARS
+            reasons.append("control_chars")
+
+        return min(score, 100.0), reasons
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SCORING ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1189,6 +1361,23 @@ class BotScoringEngine:
                 reasons.append("ai_training_crawler")
             # "allow" falls through with no adjustment
 
+        # ── 0b. Canary endpoint hit (P1 #8) ──
+        # Canaries are dead-code references buried in JS bundles. Only bots
+        # that parse JS looking for endpoints to enumerate will hit them.
+        # Treated like a honeypot: instant 100. Distinct reason tag so
+        # operators can tell JS-scraping bots apart from path scanners.
+        canary_paths = self.config.get("CANARY_PATHS") or []
+        if canary_paths:
+            req_path = req.path.split("?")[0]
+            for cp in canary_paths:
+                if req_path == cp or req_path.startswith(cp.rstrip("/") + "/"):
+                    self.deception.record_trap_access(req.ip, req.path)
+                    threat.honeypot_hit = True
+                    threat.total_score = 100.0
+                    threat.classification = "bad"
+                    threat.reasons = reasons + ["canary_hit"]
+                    return threat
+
         # ── 1. drDNS verification for claimed good bots ──
         is_claimed_good = bool(GOOD_BOT_UAS.search(req.user_agent)) if req.user_agent else False
         if is_claimed_good:
@@ -1214,6 +1403,27 @@ class BotScoringEngine:
                 reasons.append("drdns_failed_for_claimed_bot")
 
         # ── 2. Session tracking ──
+        # First-request delay gate (P1 #9): check BEFORE update() so we can
+        # tell "has never been seen" from "seen just now". If the very first
+        # request an IP makes is to a gated path (e.g. /api/chat), or
+        # arrives within FIRST_REQUEST_GATE_SECONDS of the first visit,
+        # that's a scripted-client signal — humans read the page first.
+        gate_paths = self.config.get("FIRST_REQUEST_GATE_PATHS") or []
+        gate_penalty = 0.0
+        gate_reason: str | None = None
+        if gate_paths and any(req.path.startswith(p) for p in gate_paths):
+            gate_secs = float(self.config.get("FIRST_REQUEST_GATE_SECONDS", 2.0))
+            if not self.session_tracker.has_been_seen(req.ip):
+                gate_penalty = 40.0
+                gate_reason = "direct_to_protected_no_prior_visit"
+            else:
+                since = self.session_tracker.time_since_first_seen(
+                    req.ip, now=req.timestamp
+                )
+                if since is not None and since < gate_secs:
+                    gate_penalty = 25.0
+                    gate_reason = "too_fast_to_protected"
+
         session_id = self.session_tracker.update(req)
         threat.session_id = session_id
 
@@ -1239,6 +1449,11 @@ class BotScoringEngine:
         if req_count > self.config["BURST_MAX_REQUESTS"]:
             session_score += 30.0
             reasons.append("burst_rate")
+
+        if gate_penalty > 0:
+            session_score += gate_penalty
+            if gate_reason:
+                reasons.append(gate_reason)
 
         session_score = min(100.0, session_score)
 
@@ -1272,6 +1487,29 @@ class BotScoringEngine:
             # Already failed drDNS above — penalise spoofing
             rule_score += 40
             reasons.append("spoofed_good_bot_ua")
+
+        # Audience-aware tooling UA policy (P1 #4):
+        # curl/python-requests/wget are already caught by BAD_BOT_UAS above,
+        # but on sensitive endpoints (anything with a tier in
+        # ENDPOINT_THRESHOLDS — typically /api/*) we want an additional
+        # penalty, while on public static paths we optionally discount the
+        # bad_bot_ua score for audience-oriented sites where tooling clients
+        # are legitimate.
+        if ua and TOOLING_UAS.search(ua):
+            tiers = self.config.get("ENDPOINT_THRESHOLDS") or {}
+            matched_tier = max(
+                (p for p in tiers if req.path.startswith(p)),
+                key=len, default=None,
+            )
+            if matched_tier:
+                bonus = float(self.config.get("TOOLING_UA_API_BONUS", 35))
+                rule_score += bonus
+                reasons.append("tooling_ua_on_api")
+            else:
+                discount = float(self.config.get("TOOLING_UA_STATIC_DISCOUNT", 0))
+                if discount > 0:
+                    rule_score = max(0.0, rule_score - discount)
+                    reasons.append("tooling_ua_static_discount")
 
         # Path scoring
         if PROBE_PATHS.search(req.path):

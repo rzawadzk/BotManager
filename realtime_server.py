@@ -92,6 +92,7 @@ try:
     from bot_engine import (
         BotScoringEngine, RequestSignals, ThreatScore, ScoreDatabase,
         BlocklistWriter, CONFIG, GOOD_BOT_UAS, load_config_file,
+        PromptInjectionDetector,
     )
 except ImportError:
     print("ERROR: bot_engine.py must be in the same directory or on PYTHONPATH")
@@ -469,6 +470,13 @@ class RealtimeScoringServer:
             self.biometric_captcha = BiometricCaptcha()
             self.api_protector = APIProtector()
 
+        # ── Prompt injection detector (P1 #5) ──
+        # Used by the /_bot_score_body endpoint; callable by the LLM proxy
+        # backend before forwarding prompts to the model.
+        self.prompt_detector: Optional[PromptInjectionDetector] = None
+        if CONFIG.get("PROMPT_INJECTION_ENABLED", True):
+            self.prompt_detector = PromptInjectionDetector()
+
         # ── Whitelist ──
         self.whitelist = self.config.get("WHITELIST_IPS", set())
 
@@ -622,6 +630,53 @@ class RealtimeScoringServer:
                         200,
                         headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
                         body=body,
+                    )
+                    writer.write(response)
+                    await writer.drain()
+                    return
+
+                # ── Prompt-injection body scoring (P1 #5) ──
+                # The LLM proxy backend POSTs the user's chat body here
+                # before forwarding to the model. Nginx auth_request cannot
+                # see bodies, so this is an out-of-band call. Returns a
+                # JSON verdict; the backend decides whether to forward or
+                # 400. Only localhost / trusted upstream IPs should reach
+                # this endpoint (enforce at the Unix-socket level).
+                if original_uri == "/_bot_score_body":
+                    if self.prompt_detector is None:
+                        response = HTTPParser.build_response(
+                            503, body='{"error":"prompt_injection_disabled"}',
+                        )
+                        writer.write(response)
+                        await writer.drain()
+                        return
+                    try:
+                        body_bytes = parsed.get("body", b"")
+                        payload = json.loads(body_bytes.decode("utf-8") or "{}")
+                        prompt_body = str(payload.get("body", ""))
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        self.logger.info(f"[BODY_SCORE_BAD_INPUT] {exc}")
+                        response = HTTPParser.build_response(
+                            400, body='{"error":"invalid_json"}',
+                        )
+                        writer.write(response)
+                        await writer.drain()
+                        return
+                    score, pi_reasons = self.prompt_detector.score(prompt_body)
+                    verdict = "allow"
+                    if score >= 70:
+                        verdict = "block"
+                    elif score >= 40:
+                        verdict = "suspect"
+                    result = {
+                        "score": round(score, 1),
+                        "verdict": verdict,
+                        "reasons": pi_reasons,
+                    }
+                    response = HTTPParser.build_response(
+                        200,
+                        headers={"Content-Type": "application/json"},
+                        body=json.dumps(result),
                     )
                     writer.write(response)
                     await writer.drain()
