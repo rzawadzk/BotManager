@@ -724,6 +724,20 @@ class RealtimeScoringServer:
                 # ── Decision logic ──
                 status_code, action = self._decide(threat, rate, ip)
 
+                # ── Learn mode: log what WOULD happen, but always allow ──
+                # Lets operators collect labeled traffic and tune thresholds
+                # before enabling enforcement.
+                if CONFIG.get("LEARN_MODE"):
+                    if action != "allow":
+                        self.logger.info(
+                            f"[LEARN_MODE] would_{action} ip={ip} "
+                            f"score={threat.total_score:.1f} "
+                            f"class={threat.classification} "
+                            f"path={req.path} reasons={','.join(threat.reasons[:5])}"
+                        )
+                        action = "allow"
+                        status_code = 200
+
                 # ── Build response with extra v2.1 headers ──
                 extra_headers = {}
 

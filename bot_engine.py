@@ -96,6 +96,32 @@ CONFIG = {
 
     # ── Agentic AI ──
     "MICRO_JITTER_THRESHOLD": 0.02,
+
+    # ── Endpoint-tiered thresholds ──
+    # Longest-prefix match. Missing fields fall back to default thresholds.
+    # Use this to apply stricter rules on expensive endpoints (LLM APIs) and
+    # looser rules on cheap static paths where false positives hurt more.
+    "ENDPOINT_THRESHOLDS": {
+        # Example default tier for sensitive LLM chat endpoints
+        # (override/extend via YAML config)
+        # "/api/chat": {"block": 25, "suspect": 15},
+        # "/api/":     {"block": 40, "suspect": 25},
+    },
+
+    # ── AI training crawler policy ──
+    # "block"  — treat as bad bots, instant 100 score (recommended for
+    #            content you do not want used as LLM training data)
+    # "allow"  — no special treatment; fall through to normal rules
+    # "score"  — add a fixed score but don't auto-block
+    "AI_CRAWLER_POLICY": "score",
+    "AI_CRAWLER_SCORE": 50,
+
+    # ── Learn mode ──
+    # When True, the engine still computes scores and logs decisions, but the
+    # server returns 200 (allow) regardless of classification. Use this to
+    # collect real-world traffic for ML retraining and threshold tuning
+    # before enabling blocking. Can also be set via BOT_LEARN_MODE env var.
+    "LEARN_MODE": os.environ.get("BOT_LEARN_MODE", "").lower() in ("1", "true", "yes"),
 }
 
 
@@ -173,11 +199,31 @@ class ThreatScore:
     honeypot_hit: bool = False
     drip_challenge_pending: bool = False
 
-    def classify(self, config: dict = CONFIG) -> None:
-        """Classify the threat based on total_score and thresholds."""
-        if self.total_score >= config["BLOCK_THRESHOLD"]:
+    def classify(self, config: dict = CONFIG, path: Optional[str] = None) -> None:
+        """Classify the threat based on total_score and thresholds.
+
+        If ``path`` is provided and ``config["ENDPOINT_THRESHOLDS"]`` contains
+        a matching prefix, those tier-specific thresholds override the
+        defaults. Longest-prefix wins.
+        """
+        block_t = config["BLOCK_THRESHOLD"]
+        suspect_t = config["SUSPECT_THRESHOLD"]
+        if path:
+            tiers = config.get("ENDPOINT_THRESHOLDS") or {}
+            if tiers:
+                # Longest-prefix match
+                matched = max(
+                    (p for p in tiers if path.startswith(p)),
+                    key=len, default=None,
+                )
+                if matched:
+                    tier = tiers[matched]
+                    block_t = tier.get("block", block_t)
+                    suspect_t = tier.get("suspect", suspect_t)
+
+        if self.total_score >= block_t:
             self.classification = "bad"
-        elif self.total_score >= config["SUSPECT_THRESHOLD"]:
+        elif self.total_score >= suspect_t:
             self.classification = "suspect"
         elif self.total_score > 0:
             self.classification = "unknown"
@@ -200,6 +246,30 @@ BAD_BOT_UAS = re.compile(
     r"(python-requests|python-urllib|curl/|wget/|scrapy|httpclient"
     r"|java/|libwww-perl|Go-http-client|node-fetch|axios"
     r"|PhantomJS|HeadlessChrome|Selenium|Puppeteer|Playwright)",
+    re.IGNORECASE,
+)
+
+# AI training crawlers — bots that scrape web content for LLM training data.
+# These announce themselves honestly (most respect robots.txt), but many site
+# operators want to opt out. Configure the policy via CONFIG["AI_CRAWLER_POLICY"].
+AI_CRAWLER_UAS = re.compile(
+    r"(GPTBot|ChatGPT-User|OAI-SearchBot"           # OpenAI
+    r"|ClaudeBot|Claude-Web|anthropic-ai"            # Anthropic
+    r"|Google-Extended"                              # Google Gemini training
+    r"|CCBot"                                        # Common Crawl
+    r"|Bytespider"                                   # ByteDance/TikTok
+    r"|PerplexityBot|Perplexity-User"                # Perplexity
+    r"|FacebookBot|Meta-ExternalAgent"               # Meta
+    r"|Amazonbot"                                    # Amazon
+    r"|Applebot-Extended"                            # Apple Intelligence
+    r"|cohere-ai|cohere-training-data-crawler"       # Cohere
+    r"|Diffbot"                                      # Diffbot
+    r"|Omgilibot|Omgili"                             # Webz.io
+    r"|ImageSiftBot"                                 # Hive
+    r"|YouBot"                                       # You.com
+    r"|Timpibot"                                     # Timpi
+    r"|DuckAssistBot"                                # DuckDuckGo AI
+    r")",
     re.IGNORECASE,
 )
 
@@ -1101,6 +1171,23 @@ class BotScoringEngine:
         threat.request_count += 1
 
         reasons: list[str] = []
+        ai_crawler_bonus = 0.0
+
+        # ── 0. AI training crawler policy ──
+        # Honest AI scrapers (GPTBot/ClaudeBot/etc) — apply configured policy
+        # before any other checks. They announce themselves, so no drDNS check
+        # is needed; the UA match is authoritative.
+        if req.user_agent and AI_CRAWLER_UAS.search(req.user_agent):
+            policy = self.config.get("AI_CRAWLER_POLICY", "score")
+            if policy == "block":
+                threat.total_score = 100.0
+                threat.classification = "bad"
+                threat.reasons = ["ai_training_crawler_blocked"]
+                return threat
+            elif policy == "score":
+                ai_crawler_bonus = float(self.config.get("AI_CRAWLER_SCORE", 50))
+                reasons.append("ai_training_crawler")
+            # "allow" falls through with no adjustment
 
         # ── 1. drDNS verification for claimed good bots ──
         is_claimed_good = bool(GOOD_BOT_UAS.search(req.user_agent)) if req.user_agent else False
@@ -1274,11 +1361,12 @@ class BotScoringEngine:
             + ml_score * self.WEIGHT_ML
             + session_score * self.WEIGHT_SESSION
             + agentic_score * self.WEIGHT_AGENTIC
+            + ai_crawler_bonus  # Unweighted additive bonus for AI scrapers
         )
 
         threat.total_score = max(0.0, min(100.0, combined))
         threat.reasons = reasons
-        threat.classify(self.config)
+        threat.classify(self.config, path=req.path)
 
         return threat
 

@@ -36,3 +36,32 @@ DRIP_CHALLENGE_DELAY_MS: 150
 
 # ── Agentic AI ──
 MICRO_JITTER_THRESHOLD: 0.02
+
+# ── Endpoint-tiered thresholds ──
+# Lower thresholds on expensive endpoints (LLM APIs) so suspicious traffic
+# gets blocked or challenged sooner. Matched by longest path prefix.
+# Missing fields fall back to the global BLOCK_/SUSPECT_THRESHOLD above.
+ENDPOINT_THRESHOLDS:
+  "/api/chat":
+    block: 25
+    suspect: 15
+  "/api/":
+    block: 40
+    suspect: 25
+
+# ── AI training crawler policy ──
+# "block" — treat GPTBot, ClaudeBot, CCBot, PerplexityBot, etc. as bad bots
+#           (instant 100 score; recommended for content you do not want
+#           scraped for LLM training)
+# "score" — add AI_CRAWLER_SCORE to the total; lets you observe without
+#           outright blocking
+# "allow" — no special treatment
+AI_CRAWLER_POLICY: score
+AI_CRAWLER_SCORE: 50
+
+# ── Learn mode ──
+# When true, the engine scores traffic and logs what it WOULD do, but always
+# returns 200 (allow). Use this for the first 1-2 weeks of deployment to
+# build a real-traffic dataset for ML retraining and threshold tuning.
+# Look for [LEARN_MODE] log lines to review would-be decisions.
+LEARN_MODE: false

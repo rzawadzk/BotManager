@@ -1,0 +1,73 @@
+# Bot Engine — OWASP LLM Top 10 Lab profile
+# Tuned for a low-traffic educational site with an LLM chatbot endpoint.
+# Key goals:
+#   1. Block AI training crawlers (we don't want GPTBot/ClaudeBot training on
+#      OWASP vulnerability examples)
+#   2. Cheap rule-of-thumb on static HTML/CSS/JS (researchers use curl; don't
+#      auto-block them)
+#   3. Aggressive scoring on /api/chat because each request costs real tokens
+#   4. Start in LEARN_MODE so the first 1-2 weeks collect real traffic for
+#      ML retraining without any blocking
+#
+# Usage:
+#   python3 realtime_server.py --config /etc/bot-engine/owasp_llm_lab.yaml
+
+# ── Default thresholds (apply to pages, static assets) ──
+# Keep the global block threshold relatively high so that legitimate
+# automation (curl-based payload sharing, security scanner demos) on the
+# static content doesn't get blocked. Risky traffic should still register
+# as suspect (40+).
+BLOCK_THRESHOLD: 80
+SUSPECT_THRESHOLD: 40
+BURST_MAX_REQUESTS: 25
+
+# ── Endpoint tiers — the chatbot gets much stricter rules ──
+ENDPOINT_THRESHOLDS:
+  # /api/chat — LLM calls cost real money. Block at 25, challenge at 15.
+  "/api/chat":
+    block: 25
+    suspect: 15
+  # /api/models, /api/health, etc.
+  "/api/":
+    block: 50
+    suspect: 25
+
+# ── AI training crawler policy ──
+# BLOCK: OWASP LLM Top 10 content should not be used to train models
+# that future researchers will be attacking. Fully blocking on-site.
+AI_CRAWLER_POLICY: block
+
+# ── drDNS cache ──
+DRDNS_CACHE_TTL: 3600
+
+# ── Session tracking ──
+SESSION_WINDOW_SECONDS: 300
+
+# ── Honeypot paths (static site specific) ──
+# Real researchers never hit these; scanners and scrapers will.
+HONEYPOT_PATHS:
+  - /.env
+  - /.git/config
+  - /admin
+  - /admin/login
+  - /wp-admin
+  - /wp-login.php
+  - /api/v2/_internal
+  - /api/v1/admin
+  - /backup/db.sql
+  - /config/database.yml
+  - /phpinfo.php
+  - /.DS_Store
+
+# ── Drip challenge (agentic AI detection) ──
+DRIP_CHALLENGE_DELAY_MS: 200
+
+# ── Biometric micro-jitter threshold ──
+MICRO_JITTER_THRESHOLD: 0.02
+
+# ── LEARN MODE — TURN OFF AFTER 1-2 WEEKS ──
+# Start here so the first window of real traffic is logged but not blocked,
+# giving you labeled data for retraining. Flip to false once you've
+# reviewed the dashboard, labeled ~200 requests, and retrained the ONNX
+# model on your actual traffic mix.
+LEARN_MODE: true

@@ -1,0 +1,145 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# OWASP LLM Top 10 Lab — Nginx site config (with Bot Engine integration)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Drop this into /etc/nginx/sites-available/ and symlink into sites-enabled.
+# Assumes bot_engine.conf (upstream definitions + auth endpoint) is already
+# loaded via /etc/nginx/conf.d/.
+#
+# Before enabling TLS:
+#   1. Point your domain (e.g. llm-lab.example.com) at this server
+#   2. sudo certbot --nginx -d llm-lab.example.com
+#   3. Certbot will rewrite this file with cert paths
+#
+# Start with LEARN_MODE: true in owasp_llm_lab.yaml for 1-2 weeks.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── HTTP → HTTPS redirect (Certbot will manage this) ──
+server {
+    listen 80;
+    listen [::]:80;
+    server_name llm-lab.example.com;
+
+    # Certbot http-01 challenge path
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── Main HTTPS site ──
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name llm-lab.example.com;
+
+    # SSL — paths populated by Certbot
+    ssl_certificate     /etc/letsencrypt/live/llm-lab.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/llm-lab.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root /var/www/owasp-llm-lab;
+    index index.html;
+
+    # ── Security headers (matching what's already on the site) ──
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self';" always;
+
+    # ── Disable AI training crawler access at the Nginx level too ──
+    # Double-layer defense: even before the scoring engine runs, known AI
+    # training UAs get a 403. The scoring engine adds runtime detection
+    # for new/rotated UAs.
+    if ($http_user_agent ~* "(GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-Web|anthropic-ai|Google-Extended|CCBot|Bytespider|PerplexityBot|Meta-ExternalAgent|Amazonbot|Applebot-Extended|cohere-ai|Diffbot|Omgilibot|ImageSiftBot|YouBot)") {
+        return 403;
+    }
+
+    # ── Signal capture (runs before auth_request) ──
+    access_by_lua_block {
+        local signals = require "openresty_signals"
+        signals.capture_all(ngx)
+    }
+
+    # ── Per-endpoint rate limits (cost protection) ──
+    # Defined in /etc/nginx/conf.d/bot_engine.conf or here:
+    limit_req_zone $binary_remote_addr zone=chat_api:10m rate=30r/m;
+    limit_req_zone $binary_remote_addr zone=general:10m rate=120r/m;
+
+    # ── Static site (index.html, CSS, JS) ──
+    location / {
+        auth_request /_bot_auth;
+        auth_request_set $bot_score  $upstream_http_x_bot_score;
+        auth_request_set $bot_action $upstream_http_x_bot_action;
+
+        add_header X-Bot-Score  $bot_score  always;
+        add_header X-Bot-Action $bot_action always;
+
+        limit_req zone=general burst=20 nodelay;
+        try_files $uri $uri/ =404;
+
+        # Decision routing
+        error_page 403 /403.html;
+        error_page 429 @rate_limited;
+        error_page 202 @bot_challenge;
+    }
+
+    # ── LLM chat API (the expensive, attack-surface endpoint) ──
+    location /api/chat {
+        auth_request /_bot_auth;
+        auth_request_set $bot_score  $upstream_http_x_bot_score;
+        auth_request_set $bot_action $upstream_http_x_bot_action;
+
+        # Hard rate limit: 30/min, burst 5 (cost protection)
+        limit_req zone=chat_api burst=5 nodelay;
+
+        # Forward to your LLM proxy backend
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host             $host;
+        proxy_set_header X-Real-IP        $remote_addr;
+        proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
+        proxy_set_header X-Bot-Score      $bot_score;
+
+        # Support streaming responses from the LLM
+        proxy_buffering off;
+        proxy_read_timeout 120s;
+    }
+
+    # ── Other /api/* (models list, health, etc.) ──
+    location /api/ {
+        auth_request /_bot_auth;
+        auth_request_set $bot_action $upstream_http_x_bot_action;
+
+        limit_req zone=general burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host            $host;
+        proxy_set_header X-Real-IP       $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    # ── Challenge page (PoW) for suspect traffic ──
+    location @bot_challenge {
+        default_type text/html;
+        return 202 '<!DOCTYPE html><html><head><title>Verification</title></head><body><div id="challenge">Verifying your browser...</div><script src="/js/bot_challenge.js"></script></body></html>';
+    }
+
+    location @rate_limited {
+        return 429 '{"error":"rate_limited","retry_after":60}';
+    }
+
+    # ── Robots.txt for this site (anti-AI training) ──
+    location = /robots.txt {
+        return 200 "User-agent: GPTBot\nDisallow: /\n\nUser-agent: ClaudeBot\nDisallow: /\n\nUser-agent: anthropic-ai\nDisallow: /\n\nUser-agent: Google-Extended\nDisallow: /\n\nUser-agent: CCBot\nDisallow: /\n\nUser-agent: PerplexityBot\nDisallow: /\n\nUser-agent: Bytespider\nDisallow: /\n\nUser-agent: Meta-ExternalAgent\nDisallow: /\n\nUser-agent: Amazonbot\nDisallow: /\n\nUser-agent: Applebot-Extended\nDisallow: /\n\nUser-agent: cohere-ai\nDisallow: /\n\nUser-agent: *\nAllow: /\n";
+    }
+
+    # ── Access log with bot scoring fields ──
+    access_log /var/log/nginx/owasp_llm_bot.log bot_log;
+}
