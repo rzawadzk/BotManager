@@ -1,39 +1,66 @@
 version: "3.9"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Bot Engine v2.1 — Docker Compose
+# Bot Engine v2.1 — Docker Compose (C2.2: bridge networking)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Usage:
-#   docker compose up -d
+#   cp .env.example .env                  # fill in BOT_HMAC_SECRET + DASHBOARD_PASS
+#   docker compose up -d                  # scoring + dashboard (no redis)
+#   docker compose --profile redis up -d  # above + shared redis state backend
 #   docker compose logs -f scoring
 #
-# For lowest latency, the scoring server uses --network=host so Nginx
-# can reach it via localhost:9999 without Docker bridge overhead.
-# The dashboard runs in bridge mode (latency doesn't matter for a UI).
+# Networking notes:
+#   Previously the scoring container used --network=host for minimum
+#   latency via a Unix socket. With the bridge network below:
+#     - scoring reaches redis at redis://redis:6379/0
+#     - dashboard reaches scoring at http://scoring:9999 (for /_bot_stats
+#       etc.) — not exposed to the host
+#     - only port 8080 (dashboard) and 9999 (scoring) are published on
+#       the host, and dashboard is bound to 127.0.0.1 so it's not
+#       reachable externally (put Nginx in front for TLS).
+#   Latency cost vs. host mode is ~100-300µs per scoring request, which
+#   is well under the nginx proxy_cache hit rate the engine achieves (C1.1).
+#
+# Strict HMAC secret (C2.1):
+#   The engine refuses to start if BOT_HMAC_SECRET is unset, a known
+#   placeholder, or shorter than 32 chars. Generate one with:
+#     python3 -c "import secrets; print(secrets.token_hex(32))"
+#   Disable for dev with BOT_STRICT_HMAC=false (NOT for production).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 services:
-  # ── Scoring Server (latency-critical) ──
+  # ── Scoring Server ──
   scoring:
     build: .
     container_name: bot-scoring
-    network_mode: host
     command:
       - python3
       - realtime_server.py
       - --host
-      - "127.0.0.1"
+      - "0.0.0.0"
       - --port
       - "9999"
     environment:
-      BOT_HMAC_SECRET: "${BOT_HMAC_SECRET:-change_me_in_production}"
+      # Strict HMAC secret — no weak fallback (C2.1). Deployment fails
+      # with a clear error if BOT_HMAC_SECRET is missing or weak.
+      BOT_HMAC_SECRET: "${BOT_HMAC_SECRET:?BOT_HMAC_SECRET must be set. Generate: python3 -c 'import secrets;print(secrets.token_hex(32))'}"
       BOT_DB_PATH: /var/lib/bot-engine/bot_scores.db
       BOT_BLOCKLIST_OUTPUT: /data/nginx/dynamic_blocklist.conf
+      # State backend — default in-memory; flip to "redis" to share state
+      # across multiple scoring nodes (requires the redis profile below).
+      BOT_STATE_BACKEND: "${BOT_STATE_BACKEND:-memory}"
+      BOT_REDIS_URL: "${BOT_REDIS_URL:-redis://redis:6379/0}"
     volumes:
       - bot-data:/var/lib/bot-engine
       - nginx-conf:/data/nginx
       # Optional: mount a pre-trained ONNX model
       # - ./bot_model.onnx:/var/lib/bot-engine/bot_model.onnx:ro
+    ports:
+      # Bind to loopback on the host so only the local Nginx can reach it.
+      # Remove the "127.0.0.1:" prefix if Nginx runs on a different host.
+      - "127.0.0.1:9999:9999"
+    networks:
+      - bot-net
     restart: unless-stopped
     deploy:
       resources:
@@ -46,7 +73,7 @@ services:
       timeout: 3s
       retries: 3
 
-  # ── Dashboard (not latency-critical) ──
+  # ── Dashboard ──
   dashboard:
     build: .
     container_name: bot-dashboard
@@ -61,11 +88,19 @@ services:
       - /var/lib/bot-engine/bot_scores.db
     environment:
       DASHBOARD_USER: "${DASHBOARD_USER:-admin}"
-      DASHBOARD_PASS: "${DASHBOARD_PASS:-changeme}"
+      DASHBOARD_PASS: "${DASHBOARD_PASS:?DASHBOARD_PASS must be set. Use a strong random password — do NOT use 'changeme'.}"
+      # OAuth2-proxy / authentik / Tailscale header trust (C2.4).
+      # When true, a pre-authenticated request (from an allowed proxy IP)
+      # bearing the configured user header is admitted without basic auth.
+      DASHBOARD_TRUST_PROXY_AUTH: "${DASHBOARD_TRUST_PROXY_AUTH:-false}"
+      DASHBOARD_PROXY_USER_HEADER: "${DASHBOARD_PROXY_USER_HEADER:-X-Forwarded-User}"
+      DASHBOARD_ALLOW_IPS: "${DASHBOARD_ALLOW_IPS:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
     volumes:
       - bot-data:/var/lib/bot-engine:ro
     ports:
       - "127.0.0.1:8080:8080"
+    networks:
+      - bot-net
     restart: unless-stopped
     depends_on:
       scoring:
@@ -76,8 +111,47 @@ services:
           memory: 256M
           cpus: "0.5"
 
+  # ── Redis (opt-in) ──
+  # Enable with: docker compose --profile redis up -d
+  # Required when BOT_STATE_BACKEND=redis. Multiple scoring nodes behind
+  # a load balancer share session / rate-limit / challenge state through
+  # this instance so per-IP budgets aren't reset by landing on a different
+  # node (C1.2).
+  redis:
+    image: redis:7-alpine
+    container_name: bot-redis
+    command:
+      - redis-server
+      - --save
+      - ""                         # no RDB snapshots — state is ephemeral
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - "allkeys-lru"              # drop cold sessions when pressured
+    networks:
+      - bot-net
+    restart: unless-stopped
+    profiles:
+      - redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+          cpus: "0.5"
+
 volumes:
   bot-data:
     driver: local
   nginx-conf:
     driver: local
+
+networks:
+  bot-net:
+    driver: bridge

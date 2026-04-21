@@ -96,6 +96,22 @@ POW_CONFIG = {
     # Fallback auto-generates and persists to disk so it survives restarts.
     "HMAC_SECRET": os.environ.get("BOT_HMAC_SECRET", ""),
 
+    # ── Strict HMAC secret validation (C2.1) ──
+    # When true, the engine refuses to start if the secret is empty / weak /
+    # a known placeholder AND cannot be auto-generated to a persistent path.
+    # Defaults to on for production safety; flip to "false" only for tests
+    # or ephemeral dev containers where a transient secret is acceptable.
+    "STRICT_HMAC_SECRET": os.environ.get("BOT_STRICT_HMAC", "true").lower() != "false",
+
+    # Minimum secret length in characters when STRICT_HMAC_SECRET is enabled.
+    "HMAC_SECRET_MIN_LEN": int(os.environ.get("BOT_HMAC_SECRET_MIN_LEN", "32")),
+
+    # Persisted-secret path — created on first run so restarts don't rotate
+    # the HMAC key. Must be writable by the scoring engine user and 0600.
+    "HMAC_SECRET_FILE": os.environ.get(
+        "BOT_HMAC_SECRET_FILE", "/var/lib/bot-engine/.hmac_secret"
+    ),
+
     # ── Telemetry collection time ──
     "TELEMETRY_COLLECT_MS": 3000,   # Collect mouse/env data for 3 seconds
 
@@ -185,32 +201,115 @@ class ProofOfWorkEngine:
 
     def __init__(self, config: dict | None = None):
         self.config = config or POW_CONFIG
-        self.secret = self._resolve_secret(self.config["HMAC_SECRET"])
+        self.secret = self._resolve_secret(self.config)
 
         # ── State ──
         self.pending: dict[str, MultiBatchChallenge] = {}
         self.verified: dict[str, VerifiedSession] = {}
         self.attempts: dict[str, int] = {}
 
-    @staticmethod
-    def _resolve_secret(configured: str) -> bytes:
-        """Resolve HMAC secret: env var > persisted file > generate + persist."""
+    # Secrets that look plausible but are well-known placeholders. Any of
+    # these lands the engine in a refuse-to-start state under strict mode
+    # so a "forgot to set BOT_HMAC_SECRET" deploy fails loudly instead of
+    # silently using a guessable key.
+    WEAK_PLACEHOLDERS = frozenset({
+        "change_me_in_production",
+        "CHANGE_ME_IN_PRODUCTION",
+        "changeme",
+        "change_me",
+        "changeme123",
+        "secret",
+        "test",
+        "test-secret",
+        "hmac_secret",
+        "placeholder",
+        "",
+    })
+
+    @classmethod
+    def _resolve_secret(cls, config: dict | str) -> bytes:
+        """Resolve HMAC secret with strict-mode validation.
+
+        Resolution order:
+          1. ``config["HMAC_SECRET"]`` if present and non-empty
+          2. persisted secret file (``HMAC_SECRET_FILE``), if readable
+          3. freshly-generated secret persisted to that file
+
+        In strict mode (``STRICT_HMAC_SECRET`` true, the default), the
+        engine refuses to start if:
+          - the configured secret is a known weak placeholder
+          - the configured secret is shorter than ``HMAC_SECRET_MIN_LEN``
+          - no secret is configured AND the persist path cannot be read
+            or written
+
+        A single-arg str is accepted for back-compat with tests that call
+        ``_resolve_secret("my-test-secret")`` directly — strict validation
+        is bypassed in that mode.
+        """
+        # Back-compat: tests may pass a bare string.
+        if isinstance(config, (str, bytes)):
+            value = config.decode() if isinstance(config, bytes) else config
+            return (value or secrets.token_hex(32)).encode()
+
+        configured = config.get("HMAC_SECRET", "") or ""
+        strict = bool(config.get("STRICT_HMAC_SECRET", True))
+        min_len = int(config.get("HMAC_SECRET_MIN_LEN", 32))
+        secret_path = Path(
+            config.get("HMAC_SECRET_FILE", "/var/lib/bot-engine/.hmac_secret")
+        )
+
         if configured:
+            if strict:
+                if configured in cls.WEAK_PLACEHOLDERS:
+                    raise RuntimeError(
+                        "BOT_HMAC_SECRET is a known weak placeholder "
+                        f"({configured!r}). Set a strong secret with: "
+                        "python3 -c 'import secrets; print(secrets.token_hex(32))' "
+                        "or disable strict mode with BOT_STRICT_HMAC=false."
+                    )
+                if len(configured) < min_len:
+                    raise RuntimeError(
+                        f"BOT_HMAC_SECRET is too short ({len(configured)} chars; "
+                        f"need ≥{min_len}). Generate one with: "
+                        "python3 -c 'import secrets; print(secrets.token_hex(32))'"
+                    )
             return configured.encode()
-        # Auto-generate and persist so it survives restarts
-        secret_path = Path("/var/lib/bot-engine/.hmac_secret")
+
+        # No configured secret — try the persisted file.
         try:
             if secret_path.is_file():
-                return secret_path.read_text().strip().encode()
-        except OSError:
-            pass
+                persisted = secret_path.read_text().strip()
+                if persisted:
+                    if strict and len(persisted) < min_len:
+                        raise RuntimeError(
+                            f"Persisted HMAC secret at {secret_path} is too short "
+                            f"({len(persisted)} chars; need ≥{min_len}). "
+                            "Delete the file to regenerate."
+                        )
+                    return persisted.encode()
+        except OSError as exc:
+            if strict:
+                raise RuntimeError(
+                    f"BOT_HMAC_SECRET is unset and persisted secret at "
+                    f"{secret_path} is unreadable: {exc}. Set BOT_HMAC_SECRET "
+                    "or disable strict mode with BOT_STRICT_HMAC=false."
+                ) from exc
+
+        # Generate and persist.
         new_secret = secrets.token_hex(32)
         try:
             secret_path.parent.mkdir(parents=True, exist_ok=True)
             secret_path.write_text(new_secret)
             secret_path.chmod(0o600)
-        except OSError:
-            pass  # Can't persist — secret will change on restart
+        except OSError as exc:
+            if strict:
+                raise RuntimeError(
+                    f"BOT_HMAC_SECRET is unset and cannot persist a generated "
+                    f"secret to {secret_path}: {exc}. The engine will not start "
+                    "without a stable HMAC key — set BOT_HMAC_SECRET or make "
+                    "the path writable."
+                ) from exc
+            # Non-strict: continue with ephemeral secret (tests, dev)
         return new_secret.encode()
 
     # ── helpers ──
@@ -1004,7 +1103,7 @@ class BiometricCaptcha:
 
     def __init__(self, config: dict | None = None):
         self.config = config or POW_CONFIG
-        self.secret = ProofOfWorkEngine._resolve_secret(self.config["HMAC_SECRET"])
+        self.secret = ProofOfWorkEngine._resolve_secret(self.config)
         # captcha_id -> curve params
         self._pending: dict[str, dict] = {}
 

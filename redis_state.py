@@ -37,6 +37,7 @@ explicit GC.
 
 from __future__ import annotations
 
+import ipaddress
 import statistics
 import time
 from typing import Optional
@@ -47,6 +48,26 @@ try:
 except ImportError:
     redis = None  # type: ignore[assignment]
     REDIS_AVAILABLE = False
+
+
+def _ip_bucket(ip: str, ipv6_prefix: int) -> str:
+    """Bucket an IP for state tracking (C2.3).
+
+    Mirrors bot_engine.ip_bucket so redis_state has no import cycle with
+    bot_engine. IPv6 → /ipv6_prefix network; IPv4 unchanged; invalid
+    inputs pass through.
+    """
+    if not ip:
+        return ip
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv4Address):
+        return ip
+    if ipv6_prefix >= 128:
+        return ip
+    return str(ipaddress.ip_network(f"{ip}/{ipv6_prefix}", strict=False))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -73,29 +94,40 @@ class RedisSessionTracker:
         self,
         redis_client,
         window_seconds: int = 300,
+        ipv6_prefix: int = 64,
     ) -> None:
         if not REDIS_AVAILABLE:
             raise RuntimeError("redis package not installed")
         self._r = redis_client
         self._window = window_seconds
+        self._ipv6_prefix = ipv6_prefix
         # Buffer beyond the logical window so keys don't vanish mid-eviction
         self._key_ttl = window_seconds + 60
 
+    def _bucket(self, ip: str) -> str:
+        """Collapse IPv6 to /ipv6_prefix so a bucket shares state (C2.3)."""
+        return _ip_bucket(ip, self._ipv6_prefix)
+
     def _k(self, ip: str, suffix: str) -> str:
-        return f"{self.KEY_PREFIX}{ip}:{suffix}"
+        # Embed the bucket, not the raw IP, so /64 addresses share state
+        return f"{self.KEY_PREFIX}{self._bucket(ip)}:{suffix}"
 
     def update(self, req) -> str:
-        """Record a request. Returns a session_id (IP + window bucket)."""
+        """Record a request. Returns a session_id (bucket + window start).
+
+        IPv6 addresses are collapsed to /ipv6_prefix so a scraper cycling
+        source addresses inside one allocation can't reset per-IP state.
+        """
         import hashlib
         now = req.timestamp
-        ip = req.ip
+        bucket = self._bucket(req.ip)
         cutoff = now - self._window
 
-        ts_key = self._k(ip, "ts")
-        ua_key = self._k(ip, "ua")
-        ja4_key = self._k(ip, "ja4")
-        cook_key = self._k(ip, "cookies")
-        meta_key = self._k(ip, "meta")
+        ts_key = self._k(req.ip, "ts")
+        ua_key = self._k(req.ip, "ua")
+        ja4_key = self._k(req.ip, "ja4")
+        cook_key = self._k(req.ip, "cookies")
+        meta_key = self._k(req.ip, "meta")
 
         pipe = self._r.pipeline()
         # Evict expired timestamps first (keeps sorted-set small)
@@ -122,7 +154,7 @@ class RedisSessionTracker:
         pipe.execute()
 
         window_start = int(now // self._window) * self._window
-        return hashlib.sha256(f"{ip}:{window_start}".encode()).hexdigest()[:16]
+        return hashlib.sha256(f"{bucket}:{window_start}".encode()).hexdigest()[:16]
 
     def _timestamps(self, ip: str) -> list[float]:
         cutoff = time.time() - self._window
@@ -185,15 +217,24 @@ class RedisRateTracker:
 
     KEY_PREFIX = "bot:rate:"
 
-    def __init__(self, redis_client, window_seconds: int = 10) -> None:
+    def __init__(
+        self,
+        redis_client,
+        window_seconds: int = 10,
+        ipv6_prefix: int = 64,
+    ) -> None:
         if not REDIS_AVAILABLE:
             raise RuntimeError("redis package not installed")
         self._r = redis_client
         self._window = window_seconds
+        self._ipv6_prefix = ipv6_prefix
         self._key_ttl = window_seconds + 60
 
     def _k(self, ip: str) -> str:
-        return f"{self.KEY_PREFIX}{ip}"
+        # Rate-limit per /64 so an IPv6 scraper can't dodge limits by
+        # cycling source addresses inside one allocation (C2.3).
+        bucket = _ip_bucket(ip, self._ipv6_prefix)
+        return f"{self.KEY_PREFIX}{bucket}"
 
     def record(self, ip: str, now: float) -> int:
         key = self._k(ip)
@@ -230,20 +271,29 @@ class RedisChallengeStore:
     PENDING_TTL = 60   # Challenges expire 60s after issue
     FAILURE_TTL = 3600 # Keep failure counts for 1h
 
-    def __init__(self, redis_client, ttl: int = 3600) -> None:
+    def __init__(
+        self,
+        redis_client,
+        ttl: int = 3600,
+        ipv6_prefix: int = 64,
+    ) -> None:
         if not REDIS_AVAILABLE:
             raise RuntimeError("redis package not installed")
         self._r = redis_client
         self._ttl = ttl
+        self._ipv6_prefix = ipv6_prefix
+
+    def _b(self, ip: str) -> str:
+        return _ip_bucket(ip, self._ipv6_prefix)
 
     def _vk(self, ip: str) -> str:
-        return f"{self.KEY_PREFIX}verified:{ip}"
+        return f"{self.KEY_PREFIX}verified:{self._b(ip)}"
 
     def _pk(self, ip: str) -> str:
-        return f"{self.KEY_PREFIX}pending:{ip}"
+        return f"{self.KEY_PREFIX}pending:{self._b(ip)}"
 
     def _fk(self, ip: str) -> str:
-        return f"{self.KEY_PREFIX}failures:{ip}"
+        return f"{self.KEY_PREFIX}failures:{self._b(ip)}"
 
     def is_verified(self, ip: str) -> bool:
         return bool(self._r.exists(self._vk(ip)))
@@ -349,7 +399,16 @@ def try_build_redis_state(config: dict, logger=None):
             logger.warning(f"Redis backend unavailable ({exc}); falling back to in-memory")
         return None
 
-    session = RedisSessionTracker(client, window_seconds=config.get("SESSION_WINDOW_SECONDS", 300))
-    rate = RedisRateTracker(client, window_seconds=10)
-    challenge = RedisChallengeStore(client, ttl=config.get("CHALLENGE_COOKIE_TTL", 3600))
+    ipv6_prefix = int(config.get("IPV6_BUCKET_PREFIX", 64))
+    session = RedisSessionTracker(
+        client,
+        window_seconds=config.get("SESSION_WINDOW_SECONDS", 300),
+        ipv6_prefix=ipv6_prefix,
+    )
+    rate = RedisRateTracker(client, window_seconds=10, ipv6_prefix=ipv6_prefix)
+    challenge = RedisChallengeStore(
+        client,
+        ttl=config.get("CHALLENGE_COOKIE_TTL", 3600),
+        ipv6_prefix=ipv6_prefix,
+    )
     return (session, rate, challenge)

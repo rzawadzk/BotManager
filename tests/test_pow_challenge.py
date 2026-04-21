@@ -21,7 +21,13 @@ from pow_challenge import (
 class TestProofOfWorkEngine:
     @pytest.fixture
     def engine(self):
-        config = {**POW_CONFIG, "HMAC_SECRET": "test-secret-key"}
+        # STRICT_HMAC_SECRET disabled so short test secrets are accepted;
+        # the C2.1 strict-mode rules are covered in tests/test_c2.py.
+        config = {
+            **POW_CONFIG,
+            "HMAC_SECRET": "test-secret-key",
+            "STRICT_HMAC_SECRET": False,
+        }
         return ProofOfWorkEngine(config=config)
 
     def test_generate_challenge(self, engine):

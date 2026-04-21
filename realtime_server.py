@@ -92,7 +92,7 @@ try:
     from bot_engine import (
         BotScoringEngine, RequestSignals, ThreatScore, ScoreDatabase,
         BlocklistWriter, CONFIG, GOOD_BOT_UAS, load_config_file,
-        PromptInjectionDetector,
+        PromptInjectionDetector, ip_bucket,
     )
 except ImportError:
     print("ERROR: bot_engine.py must be in the same directory or on PYTHONPATH")
@@ -270,24 +270,34 @@ class Metrics:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class RateTracker:
-    """Sliding window rate tracker using per-second bucket counts."""
+    """Sliding window rate tracker using per-second bucket counts.
 
-    def __init__(self, window_seconds: int = 10, max_ips: int = 100_000):
+    IPv6 addresses are grouped by ``ipv6_prefix`` (default /64) so a scraper
+    cycling across addresses in a single /64 cannot bypass per-IP budgets
+    (C2.3). IPv4 is unaffected.
+    """
+
+    def __init__(self, window_seconds: int = 10, max_ips: int = 100_000, ipv6_prefix: int = 64):
         self.window = window_seconds
         self.max_ips = max_ips
+        self.ipv6_prefix = ipv6_prefix
         self._data: dict[str, dict[int, int]] = {}
 
+    def _k(self, ip: str) -> str:
+        return ip_bucket(ip, self.ipv6_prefix)
+
     def record(self, ip: str, now: float) -> int:
+        key = self._k(ip)
         bucket = int(now)
         cutoff = bucket - self.window
 
-        if ip not in self._data:
+        if key not in self._data:
             if len(self._data) >= self.max_ips:
                 evict_ip = next(iter(self._data))
                 del self._data[evict_ip]
-            self._data[ip] = {}
+            self._data[key] = {}
 
-        buckets = self._data[ip]
+        buckets = self._data[key]
         buckets[bucket] = buckets.get(bucket, 0) + 1
 
         count = 0
@@ -308,45 +318,56 @@ class RateTracker:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ChallengeStore:
-    """Track which IPs have been challenged and whether they passed."""
+    """Track which IPs have been challenged and whether they passed.
 
-    def __init__(self, ttl: int = 3600):
+    IPv6 addresses are collapsed to ``ipv6_prefix`` (default /64) so one
+    challenge pass covers the whole /64 bucket (C2.3). IPv4 is unaffected.
+    """
+
+    def __init__(self, ttl: int = 3600, ipv6_prefix: int = 64):
         self.ttl = ttl
+        self.ipv6_prefix = ipv6_prefix
         self.verified: dict[str, float] = {}
         self.pending: dict[str, tuple[str, float]] = {}
         self.failures: dict[str, int] = defaultdict(int)
 
+    def _b(self, ip: str) -> str:
+        return ip_bucket(ip, self.ipv6_prefix)
+
     def is_verified(self, ip: str) -> bool:
-        if ip in self.verified:
-            if time.time() < self.verified[ip]:
+        key = self._b(ip)
+        if key in self.verified:
+            if time.time() < self.verified[key]:
                 return True
-            del self.verified[ip]
+            del self.verified[key]
         return False
 
     def mark_verified(self, ip: str):
-        self.verified[ip] = time.time() + self.ttl
+        self.verified[self._b(ip)] = time.time() + self.ttl
 
     def issue_challenge(self, ip: str, token: str):
-        self.pending[ip] = (token, time.time())
+        self.pending[self._b(ip)] = (token, time.time())
 
     def verify(self, ip: str, token: str) -> bool:
-        if ip not in self.pending:
+        key = self._b(ip)
+        if key not in self.pending:
             return False
-        expected_token, issued_at = self.pending[ip]
+        expected_token, issued_at = self.pending[key]
         if token == expected_token and (time.time() - issued_at) < 60:
-            self.verified[ip] = time.time() + self.ttl
-            del self.pending[ip]
+            self.verified[key] = time.time() + self.ttl
+            del self.pending[key]
             return True
-        self.failures[ip] += 1
+        self.failures[key] += 1
         return False
 
     def needs_challenge(self, ip: str) -> bool:
         if self.is_verified(ip):
             return False
-        if ip in self.pending:
-            _, issued_at = self.pending[ip]
+        key = self._b(ip)
+        if key in self.pending:
+            _, issued_at = self.pending[key]
             if time.time() - issued_at > 60:
-                del self.pending[ip]
+                del self.pending[key]
                 return True
             return False
         return True
@@ -507,7 +528,12 @@ class RealtimeScoringServer:
         Redis mode: cross-node shared state so a request hitting node A
         counts against rate/challenge budgets even if prior requests hit
         node B. Falls back to in-memory on any Redis failure — fail-open.
+
+        Both backends bucket IPv6 addresses by ``IPV6_BUCKET_PREFIX`` (C2.3)
+        so scrapers can't rotate source addresses within a /64 to escape
+        per-IP budgets.
         """
+        ipv6_prefix = int(CONFIG.get("IPV6_BUCKET_PREFIX", 64))
         if CONFIG.get("STATE_BACKEND") == "redis":
             try:
                 from redis_state import (
@@ -517,9 +543,13 @@ class RealtimeScoringServer:
                     CONFIG.get("REDIS_URL", "redis://localhost:6379/0"),
                 )
                 return (
-                    RedisRateTracker(client, window_seconds=10),
+                    RedisRateTracker(
+                        client, window_seconds=10, ipv6_prefix=ipv6_prefix,
+                    ),
                     RedisChallengeStore(
-                        client, ttl=self.config["CHALLENGE_COOKIE_TTL"],
+                        client,
+                        ttl=self.config["CHALLENGE_COOKIE_TTL"],
+                        ipv6_prefix=ipv6_prefix,
                     ),
                 )
             except Exception as exc:
@@ -529,8 +559,11 @@ class RealtimeScoringServer:
                     file=sys.stderr,
                 )
         return (
-            RateTracker(window_seconds=10),
-            ChallengeStore(ttl=self.config["CHALLENGE_COOKIE_TTL"]),
+            RateTracker(window_seconds=10, ipv6_prefix=ipv6_prefix),
+            ChallengeStore(
+                ttl=self.config["CHALLENGE_COOKIE_TTL"],
+                ipv6_prefix=ipv6_prefix,
+            ),
         )
 
     # ──────────────────────────────────────────────────────────────────────────

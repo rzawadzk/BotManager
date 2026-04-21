@@ -16,9 +16,15 @@ RestartSec=2
 WatchdogSec=30
 
 # Environment
-Environment=BOT_HMAC_SECRET=CHANGE_ME_IN_PRODUCTION
+# NOTE: BOT_HMAC_SECRET is NOT hard-coded here any more (C2.1). Put it
+# in /etc/bot-engine/env with mode 0600, along with any other secrets.
+# Example /etc/bot-engine/env:
+#     BOT_HMAC_SECRET=<64-hex-char secret from `python3 -c 'import secrets;print(secrets.token_hex(32))'`>
+# The engine will refuse to start if the secret is unset, a known
+# placeholder, or shorter than 32 chars.
 Environment=BOT_DB_PATH=/var/lib/bot-engine/bot_scores.db
 Environment=BOT_BLOCKLIST_OUTPUT=/etc/nginx/conf.d/dynamic_blocklist.conf
+Environment=BOT_HMAC_SECRET_FILE=/var/lib/bot-engine/.hmac_secret
 EnvironmentFile=-/etc/bot-engine/env
 
 # Runtime directory (auto-created, auto-cleaned)

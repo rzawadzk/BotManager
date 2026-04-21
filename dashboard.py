@@ -37,6 +37,19 @@ DB_PATH = "/var/lib/bot-engine/bot_scores.db"
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "changeme")
 
+# ── Proxy-header trust (C2.4) ──
+# When the dashboard runs behind an auth-gating reverse proxy (oauth2-proxy,
+# authentik, Tailscale serve, Cloudflare Access, ...), that proxy typically
+# terminates auth and injects a header like X-Forwarded-User with the
+# authenticated identity. Setting DASHBOARD_TRUST_PROXY_AUTH=true tells the
+# dashboard to admit requests carrying that header WITHOUT requiring Basic
+# Auth — but ONLY when the request's client IP is inside DASHBOARD_ALLOW_IPS.
+# The allowlist is the trust boundary: if anyone can reach the dashboard
+# directly (bypassing the proxy), they can forge the header. So keep the
+# allowlist narrow — ideally just the proxy's address.
+DASHBOARD_TRUST_PROXY_AUTH = os.environ.get("DASHBOARD_TRUST_PROXY_AUTH", "false").lower() == "true"
+DASHBOARD_PROXY_USER_HEADER = os.environ.get("DASHBOARD_PROXY_USER_HEADER", "X-Forwarded-User").lower()
+
 # ── IP allowlist ──
 # Comma-separated list of IPs/CIDRs allowed to access the dashboard.
 # Default: localhost only. Set DASHBOARD_ALLOW_IPS="0.0.0.0/0" to allow all.
@@ -472,6 +485,19 @@ async def auth_middleware(request: Request, call_next):
     if not _ip_allowed(client_ip):
         return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
+    # Proxy-header trust (C2.4): if enabled and the client IP is in the
+    # (narrow) allowlist, admit requests that carry a proxy-injected user
+    # header. The IP allowlist is the trust boundary — anyone outside it
+    # already got rejected above, so the header cannot be forged by an
+    # arbitrary internet client. Stash the identity on request.state so
+    # downstream handlers can log/audit who acted.
+    if DASHBOARD_TRUST_PROXY_AUTH:
+        proxy_user = request.headers.get(DASHBOARD_PROXY_USER_HEADER, "").strip()
+        if proxy_user:
+            request.state.dashboard_user = proxy_user
+            request.state.dashboard_auth_method = "proxy"
+            return await call_next(request)
+
     # Brute-force rate limit check
     if _check_auth_rate_limit(client_ip):
         return JSONResponse(
@@ -504,6 +530,8 @@ async def auth_middleware(request: Request, call_next):
             status_code=401, content={"detail": "Invalid credentials"},
             headers={"WWW-Authenticate": "Basic"},
         )
+    request.state.dashboard_user = username
+    request.state.dashboard_auth_method = "basic"
     return await call_next(request)
 
 

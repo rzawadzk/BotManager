@@ -165,7 +165,54 @@ CONFIG = {
     #           "memory" if redis is unreachable at startup (fail-open).
     "STATE_BACKEND": os.environ.get("BOT_STATE_BACKEND", "memory"),
     "REDIS_URL": os.environ.get("BOT_REDIS_URL", "redis://localhost:6379/0"),
+
+    # ── IPv6 /64 grouping (C2.3) ──
+    # Cloud providers typically allocate a full /64 to a single host, so a
+    # scraper can cycle source addresses inside one /64 to defeat per-IP
+    # budgets. With prefix=64 (default), all session tracking / rate
+    # limiting / challenge state / blocklist entries are keyed on the /64
+    # network rather than the individual address. IPv4 is unaffected.
+    # Raise to 128 to disable grouping (legacy per-address mode).
+    # Lower to e.g. 48 to group by allocation block for even harder
+    # enforcement (risks punishing shared ISP blocks).
+    "IPV6_BUCKET_PREFIX": int(os.environ.get("BOT_IPV6_BUCKET_PREFIX", "64")),
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IP BUCKETING (C2.3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def ip_bucket(ip: str, ipv6_prefix: int = 64) -> str:
+    """Return the state-tracking key for an IP.
+
+    IPv6 addresses are collapsed to their /``ipv6_prefix`` network so a
+    scraper cycling source addresses inside one allocation can't reset
+    its per-IP budget. IPv4 addresses pass through unchanged.
+
+    Invalid inputs return the original string (so we never fail scoring
+    on a malformed X-Real-IP header).
+
+    >>> ip_bucket("1.2.3.4")
+    '1.2.3.4'
+    >>> ip_bucket("2001:db8:abcd:1234:ffff::1", ipv6_prefix=64)
+    '2001:db8:abcd:1234::/64'
+    >>> ip_bucket("2001:db8:abcd:1234:ffff::1", ipv6_prefix=128)
+    '2001:db8:abcd:1234:ffff::1'
+    """
+    if not ip:
+        return ip
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv4Address):
+        return ip
+    # IPv6 — collapse to the requested prefix. /128 means "no grouping".
+    if ipv6_prefix >= 128:
+        return ip
+    net = ipaddress.ip_network(f"{ip}/{ipv6_prefix}", strict=False)
+    return str(net)
 
 
 def load_config_file(path: str) -> dict:
@@ -743,11 +790,17 @@ class SessionTracker:
         self,
         window_seconds: int = CONFIG["SESSION_WINDOW_SECONDS"],
         max_ips: int = DEFAULT_MAX_IPS,
+        ipv6_prefix: int = 64,
     ) -> None:
         self._window = window_seconds
         self._max_ips = max_ips
+        self._ipv6_prefix = ipv6_prefix
         self._sessions: dict[str, _SessionRecord] = {}
         self._lock = threading.Lock()
+
+    def _k(self, ip: str) -> str:
+        """Bucket an IP for state tracking (C2.3)."""
+        return ip_bucket(ip, self._ipv6_prefix)
 
     def _evict(self, record: _SessionRecord, now: float) -> None:
         """Remove entries older than the rolling window using bisect (O(log N))."""
@@ -777,21 +830,23 @@ class SessionTracker:
         """
         Record a request in the session tracker.
 
-        Returns a session_id (hash of IP + window start).
+        Returns a session_id (hash of bucket + window start). IPv6 addresses
+        are grouped by /ipv6_prefix (C2.3) so a scraper can't reset per-IP
+        budgets by rotating source addresses within one allocation.
         """
         now = req.timestamp
-        ip = req.ip
+        key = self._k(req.ip)
 
         with self._lock:
-            if ip not in self._sessions:
+            if key not in self._sessions:
                 # Enforce hard cap — evict LRU entries if at capacity
                 if len(self._sessions) >= self._max_ips:
                     self._lru_evict(max(1, self._max_ips // 20))  # evict 5%
                 rec = _SessionRecord()
                 rec.first_seen = now
-                self._sessions[ip] = rec
+                self._sessions[key] = rec
 
-            rec = self._sessions[ip]
+            rec = self._sessions[key]
             self._evict(rec, now)
 
             rec.timestamps.append(now)
@@ -806,7 +861,7 @@ class SessionTracker:
 
         window_start = int(now // self._window) * self._window
         session_id = hashlib.sha256(
-            f"{ip}:{window_start}".encode()
+            f"{key}:{window_start}".encode()
         ).hexdigest()[:16]
         return session_id
 
@@ -819,8 +874,9 @@ class SessionTracker:
         High jitter (>1s) suggests human browsing.
         Returns -1.0 if insufficient data.
         """
+        key = self._k(ip)
         with self._lock:
-            rec = self._sessions.get(ip)
+            rec = self._sessions.get(key)
             if not rec or len(rec.timestamps) < 3:
                 return -1.0
             timestamps = list(rec.timestamps)
@@ -840,13 +896,15 @@ class SessionTracker:
     def identity_drift(self, ip: str) -> float:
         """
         Measure identity drift: how many distinct UA / JA4 / cookie
-        combinations have been seen from this IP in the current window.
+        combinations have been seen from this IP (or IPv6 /64 bucket) in
+        the current window.
 
         Higher drift suggests a bot rotating fingerprints.
         Returns 0.0 for a single consistent identity.
         """
+        key = self._k(ip)
         with self._lock:
-            rec = self._sessions.get(ip)
+            rec = self._sessions.get(key)
             if not rec:
                 return 0.0
             n_ua = len(rec.user_agents)
@@ -858,27 +916,30 @@ class SessionTracker:
         return float(drift)
 
     def request_count(self, ip: str) -> int:
-        """Return number of requests in the current window for an IP."""
+        """Return number of requests in the current window for this IP / bucket."""
+        key = self._k(ip)
         with self._lock:
-            rec = self._sessions.get(ip)
+            rec = self._sessions.get(key)
             return len(rec.timestamps) if rec else 0
 
     def has_been_seen(self, ip: str) -> bool:
-        """True if this IP already has a session record (seen previously)."""
+        """True if this IP / bucket already has a session record."""
+        key = self._k(ip)
         with self._lock:
-            return ip in self._sessions
+            return key in self._sessions
 
     def time_since_first_seen(self, ip: str, now: float | None = None) -> float | None:
-        """Seconds since this IP was first recorded; None if never seen.
+        """Seconds since this IP / bucket was first recorded; None if never seen.
 
-        Used by the first-request delay gate: if an IP's very first request
-        targets a protected endpoint (no prior browsing), or arrives within
-        a tiny window of that first request, that's a strong bot signal.
+        Used by the first-request delay gate: if a bucket's very first
+        request targets a protected endpoint (no prior browsing), or arrives
+        within a tiny window of that first request, that's a strong bot signal.
         """
         if now is None:
             now = time.time()
+        key = self._k(ip)
         with self._lock:
-            rec = self._sessions.get(ip)
+            rec = self._sessions.get(key)
             if rec is None or rec.first_seen == 0.0:
                 return None
             return now - rec.first_seen
@@ -1346,6 +1407,7 @@ class BotScoringEngine:
         Falls back to the in-memory implementation on any Redis failure —
         the engine never fails closed because the state backend is down.
         """
+        ipv6_prefix = int(self.config.get("IPV6_BUCKET_PREFIX", 64))
         if self.config.get("STATE_BACKEND") == "redis":
             try:
                 from redis_state import build_redis_client, RedisSessionTracker
@@ -1355,6 +1417,7 @@ class BotScoringEngine:
                 return RedisSessionTracker(
                     client,
                     window_seconds=self.config["SESSION_WINDOW_SECONDS"],
+                    ipv6_prefix=ipv6_prefix,
                 )
             except Exception as exc:
                 # Log to stderr so ops can see the fallback. Don't use a
@@ -1366,7 +1429,8 @@ class BotScoringEngine:
                     file=sys.stderr,
                 )
         return SessionTracker(
-            window_seconds=self.config["SESSION_WINDOW_SECONDS"]
+            window_seconds=self.config["SESSION_WINDOW_SECONDS"],
+            ipv6_prefix=ipv6_prefix,
         )
 
     def evaluate(self, req: RequestSignals) -> ThreatScore:
@@ -1805,14 +1869,43 @@ class BlocklistWriter:
 
     @staticmethod
     def write_nginx_deny(ips: list[str], output_path: str,
-                         reload_nginx: bool = True) -> None:
-        """Write an Nginx-compatible blocklist file and optionally reload Nginx."""
+                         reload_nginx: bool = True,
+                         ipv6_prefix: int = 64) -> None:
+        """Write an Nginx-compatible blocklist file and optionally reload Nginx.
+
+        IPv6 entries are widened to ``/ipv6_prefix`` networks so blocking one
+        address from a /64 covers the entire allocation (C2.3). Duplicate
+        buckets produced by collapse are deduplicated. IPv4 entries are
+        written unchanged.
+        """
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        lines = [f"deny {ip};" for ip in sorted(ips)]
+
+        # Bucket IPv6 addresses; dedupe.
+        bucketed: set[str] = set()
+        for ip in ips:
+            try:
+                addr = ipaddress.ip_address(ip.split("/")[0])
+            except ValueError:
+                # Assume it's already a CIDR or malformed — pass through
+                bucketed.add(ip)
+                continue
+            if isinstance(addr, ipaddress.IPv4Address):
+                bucketed.add(str(addr))
+            else:
+                if ipv6_prefix >= 128:
+                    bucketed.add(str(addr))
+                else:
+                    net = ipaddress.ip_network(
+                        f"{addr}/{ipv6_prefix}", strict=False
+                    )
+                    bucketed.add(str(net))
+
+        lines = [f"deny {entry};" for entry in sorted(bucketed)]
         content = (
             "# Auto-generated by bot-engine — do not edit\n"
             f"# Updated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"# Blocked IPs: {len(ips)}\n\n"
+            f"# Blocked entries: {len(bucketed)} "
+            f"(IPv6 grouped by /{ipv6_prefix})\n\n"
             + "\n".join(lines)
             + "\n"
         )
