@@ -20,8 +20,14 @@ Usage examples
 """
 
 import argparse
+import datetime as _dt
+import hashlib
+import math
+import re
 import time
+from collections import Counter
 from pathlib import Path
+from typing import Iterator, Optional
 
 import numpy as np
 import onnxruntime as ort
@@ -190,6 +196,278 @@ def generate_synthetic_data(
     # Shuffle
     perm = rng.permutation(len(X))
     return X[perm], y[perm]
+
+
+# ---------------------------------------------------------------------------
+# Real-traffic ingestion (C1.3)
+# ---------------------------------------------------------------------------
+# Parse nginx bot_access.log lines of the form emitted by the `bot_log`
+# log_format defined in nginx/bot_engine.conf:
+#
+#   $remote_addr [$time_local] "$request" $status
+#       score=$upstream_http_x_bot_score
+#       action=$upstream_http_x_bot_action
+#       class=$upstream_http_x_bot_classification
+#       ua="$http_user_agent"
+#       ja4=$upstream_http_x_ja4_hash
+#       rt=$request_time
+#
+# Each line is auto-labelled with deterministic rules; ambiguous rows are
+# dropped. Per-IP aggregation supplies temporal_jitter / identity_drift /
+# request_rate. The resulting (X, y) is concatenated with the synthetic
+# corpus so the model sees actual production traffic patterns.
+
+_LOG_LINE_RE = re.compile(
+    r'^(?P<ip>\S+)\s+'
+    r'\[(?P<time>[^\]]+)\]\s+'
+    r'"(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<proto>[^"]+)"\s+'
+    r'(?P<status>\d+)\s+'
+    r'score=(?P<score>\S+)\s+'
+    r'action=(?P<action>\S+)\s+'
+    r'class=(?P<cls>\S+)\s+'
+    r'ua="(?P<ua>.*?)"\s+'
+    r'ja4=(?P<ja4>\S+)\s+'
+    r'rt=(?P<rt>\S+)'
+)
+
+_HONEYPOT_RE = re.compile(r"^/(api/v2/internal|admin/export|backup/db|\.env|debug/config)")
+
+_METHOD_ENCODING = {
+    "GET": 0, "POST": 1, "PUT": 2, "DELETE": 3,
+    "HEAD": 4, "PATCH": 5, "OPTIONS": 6,
+}
+
+# Default channel-bound features we cannot infer from a log line. Matched
+# to the centres of the synthetic human distribution so log rows don't get
+# artificially pushed away from the legit cluster on unknown axes.
+_LOG_DEFAULTS = {
+    "h2_fp_int": 0.0,
+    "h3_present": 0.0,
+    "header_count": 10.0,
+    "has_accept_language": 1.0,
+    "has_accept": 1.0,
+    "has_cookie": 0.0,
+    "has_referer": 0.0,
+    "content_length": 0.0,
+    "is_tls": 1.0,
+}
+
+
+def _parse_nginx_time(s: str) -> float:
+    """Parse nginx's $time_local ('15/Apr/2026:12:34:56 +0000') → unix ts."""
+    try:
+        return _dt.datetime.strptime(s, "%d/%b/%Y:%H:%M:%S %z").timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _ua_entropy(ua: str) -> float:
+    """Shannon entropy (bits) over the character distribution of a UA string."""
+    if not ua:
+        return 0.0
+    counts = Counter(ua)
+    total = len(ua)
+    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
+def _to_float(s: str) -> float:
+    """Parse a log field that may be '-' for missing values."""
+    if s in ("-", "", None):
+        return 0.0
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_bot_access_log(log_path: str) -> Iterator[dict]:
+    """Yield parsed rows from a nginx bot_access.log file.
+
+    Unparseable lines are skipped silently. The stream may be gigabytes;
+    this is a generator so the caller can stream-process it.
+    """
+    with open(log_path, "r", errors="replace") as f:
+        for line in f:
+            m = _LOG_LINE_RE.match(line)
+            if not m:
+                continue
+            yield {
+                "ip": m.group("ip"),
+                "ts": _parse_nginx_time(m.group("time")),
+                "method": m.group("method").upper(),
+                "path": m.group("path"),
+                "status": int(m.group("status")),
+                "score": _to_float(m.group("score")),
+                "action": m.group("action"),
+                "cls": m.group("cls"),
+                "ua": m.group("ua"),
+                "ja4": m.group("ja4"),
+                "rt": _to_float(m.group("rt")),
+            }
+
+
+def _compute_ip_stats(rows: list[dict]) -> dict[str, dict]:
+    """Group rows by IP and compute per-IP session features."""
+    by_ip: dict[str, list[dict]] = {}
+    for row in rows:
+        by_ip.setdefault(row["ip"], []).append(row)
+
+    stats: dict[str, dict] = {}
+    for ip, rlist in by_ip.items():
+        rlist.sort(key=lambda r: r["ts"])
+        timestamps = [r["ts"] for r in rlist if r["ts"] > 0]
+
+        jitter = 0.0
+        if len(timestamps) >= 3:
+            deltas = np.diff(timestamps)
+            jitter = float(np.std(deltas)) if len(deltas) else 0.0
+
+        if len(timestamps) >= 2:
+            duration = max(1.0, timestamps[-1] - timestamps[0])
+            rate = len(rlist) / duration * 60.0  # req/min
+        else:
+            rate = 1.0
+
+        uas = {r["ua"] for r in rlist if r["ua"]}
+        stats[ip] = {
+            "count": len(rlist),
+            "jitter": jitter,
+            "identity_drift": max(1, len(uas)),
+            "request_rate": rate,
+        }
+    return stats
+
+
+def autolabel_row(row: dict, ip_stats: dict) -> Optional[int]:
+    """Deterministically label a row as bad (1), good (0), or skip (None).
+
+    Rules (highest-precedence first):
+      - Honeypot hit (path or class) → bad
+      - class ∈ {verified_good_bot, good_bot} → good
+      - action=block AND engine score ≥ 80 → bad
+      - high-volume burst (>120 req/min) with low class confidence → bad
+      - class=human + action=allow + 200 status + ≥3 same-IP requests → good
+      - anything else → skip (ambiguous; don't train on it)
+    """
+    path = row.get("path", "")
+    cls = row.get("cls", "")
+    action = row.get("action", "")
+    score = row.get("score", 0.0)
+    status = row.get("status", 0)
+    stats = ip_stats.get(row.get("ip", ""), {})
+
+    # Honeypot access = unambiguous bad-bot signal
+    if _HONEYPOT_RE.match(path):
+        return 1
+    if cls == "honeypot" or action == "honeypot":
+        return 1
+
+    # Explicit good-bot verification — trust engine's drDNS outcome
+    if cls in ("verified_good_bot", "good_bot"):
+        return 0
+
+    # Engine already blocked with very high confidence
+    if action == "block" and score >= 80:
+        return 1
+
+    # Burst patterns the engine didn't outright block but that look bot-like
+    if stats.get("request_rate", 0.0) >= 120.0 and score >= 50:
+        return 1
+
+    # Clean human traffic on allow path — must have enough volume to be
+    # a real session, not a single probe.
+    if (cls == "human" and action == "allow" and status == 200
+            and stats.get("count", 0) >= 3):
+        return 0
+
+    return None
+
+
+def _row_to_feature_vec(row: dict, ip_stats: dict) -> np.ndarray:
+    """Build an 18-d feature vector matching FEATURE_NAMES order."""
+    ua = row.get("ua") or ""
+    ja4 = row.get("ja4", "") or ""
+    path = row.get("path", "/")
+    method = row.get("method", "GET")
+    ts = row.get("ts", 0.0)
+    ip = row.get("ip", "")
+    stats = ip_stats.get(ip, {})
+
+    if ja4 and ja4 != "-":
+        ja4_int = int(hashlib.md5(ja4.encode("utf-8")).hexdigest()[:8], 16)
+    else:
+        ja4_int = 0
+
+    hour = _dt.datetime.fromtimestamp(ts).hour if ts > 0 else 12
+
+    return np.array([
+        float(ja4_int),                                   # ja4_hash_int
+        _LOG_DEFAULTS["h2_fp_int"],                       # h2_fp_int
+        _LOG_DEFAULTS["h3_present"],                      # h3_present
+        float(len(ua)),                                   # ua_length
+        float(_ua_entropy(ua)),                           # ua_entropy
+        _LOG_DEFAULTS["header_count"],                    # header_count
+        float(path.count("/")),                           # path_depth
+        float(_METHOD_ENCODING.get(method, 0)),           # method_encoded
+        _LOG_DEFAULTS["has_accept_language"],             # has_accept_language
+        _LOG_DEFAULTS["has_accept"],                      # has_accept
+        _LOG_DEFAULTS["has_cookie"],                      # has_cookie
+        _LOG_DEFAULTS["has_referer"],                     # has_referer
+        _LOG_DEFAULTS["content_length"],                  # content_length
+        float(hour),                                      # hour_of_day
+        float(stats.get("jitter", 1.0)),                  # temporal_jitter
+        float(stats.get("identity_drift", 1)),            # identity_drift
+        float(stats.get("request_rate", 1.0)),            # request_rate
+        _LOG_DEFAULTS["is_tls"],                          # is_tls
+    ], dtype=np.float32)
+
+
+def ingest_real_traffic(
+    log_path: str,
+    max_rows: Optional[int] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Parse a bot_access.log and return (X, y) for training.
+
+    `max_rows` (if given) keeps only the most recent N rows from the log,
+    which is useful for capping memory on multi-GB files.
+
+    Returns empty arrays with the correct dtype/shape if the log is empty
+    or no rows survived auto-labelling.
+    """
+    rows = list(parse_bot_access_log(log_path))
+    if max_rows is not None and max_rows > 0 and len(rows) > max_rows:
+        rows = rows[-max_rows:]
+
+    if not rows:
+        return (np.zeros((0, NUM_FEATURES), dtype=np.float32),
+                np.zeros(0, dtype=np.int32))
+
+    stats = _compute_ip_stats(rows)
+
+    X_list: list[np.ndarray] = []
+    y_list: list[int] = []
+    labelled = 0
+    skipped = 0
+    for row in rows:
+        label = autolabel_row(row, stats)
+        if label is None:
+            skipped += 1
+            continue
+        X_list.append(_row_to_feature_vec(row, stats))
+        y_list.append(label)
+        labelled += 1
+
+    print(f"  Log rows parsed  : {len(rows)}")
+    print(f"  Auto-labelled    : {labelled} (skipped {skipped} ambiguous)")
+    if labelled == 0:
+        return (np.zeros((0, NUM_FEATURES), dtype=np.float32),
+                np.zeros(0, dtype=np.int32))
+
+    X = np.vstack(X_list).astype(np.float32)
+    y = np.array(y_list, dtype=np.int32)
+    pos = int((y == 1).sum())
+    print(f"  Real-traffic mix : good={len(y) - pos}, bad={pos}")
+    return X, y
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +667,21 @@ def main() -> None:
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help=("Path to nginx bot_access.log (bot_log format) to ingest as real "
+              "training traffic. Auto-labelled with deterministic rules and "
+              "concatenated with the synthetic corpus."),
+    )
+    parser.add_argument(
+        "--max-log-rows",
+        type=int,
+        default=500_000,
+        help=("Cap on real-traffic rows ingested from --log-file (keeps the "
+              "most recent N). Set to 0 to disable the cap. Default: 500000"),
+    )
 
     args = parser.parse_args()
 
@@ -396,6 +689,22 @@ def main() -> None:
     X, y = generate_synthetic_data(n_samples=args.samples, seed=args.seed)
     print(f"  Shape: X={X.shape}, y={y.shape}")
     print(f"  Label distribution: 0={int((y == 0).sum())}, 1={int((y == 1).sum())}")
+
+    if args.log_file:
+        print(f"\n[1b/4] Ingesting real traffic from {args.log_file} ...")
+        cap = args.max_log_rows if args.max_log_rows > 0 else None
+        X_real, y_real = ingest_real_traffic(args.log_file, max_rows=cap)
+        if len(X_real) > 0:
+            X = np.vstack([X, X_real]).astype(np.float32)
+            y = np.concatenate([y, y_real]).astype(np.int32)
+            # Reshuffle so real rows aren't bunched at the tail during split
+            perm = np.random.default_rng(args.seed).permutation(len(X))
+            X, y = X[perm], y[perm]
+            print(f"  Combined shape    : X={X.shape}, y={y.shape}")
+            print(f"  Final distribution: 0={int((y == 0).sum())}, "
+                  f"1={int((y == 1).sum())}")
+        else:
+            print("  No usable real-traffic rows; proceeding with synthetic only.")
 
     print("\n[2/4] Training XGBoost classifier ...")
     np.random.seed(args.seed)

@@ -98,3 +98,14 @@ FIRST_REQUEST_GATE_PATHS:
 # proxy backend should call this with the user's prompt BEFORE forwarding
 # to the model, and reject requests with verdict "block".
 PROMPT_INJECTION_ENABLED: true
+
+# ── State backend (C1.2) ──
+# Where session / rate / challenge state lives.
+#   memory : per-process in-memory (default; lost on restart, not shared)
+#   redis  : shared Redis instance — required for horizontal scaling so a
+#            request hitting node A sees the session history from node B
+# If redis is unreachable at startup, the engine falls back to memory with
+# a stderr warning. Can be overridden by BOT_STATE_BACKEND / BOT_REDIS_URL
+# environment variables.
+STATE_BACKEND: memory
+REDIS_URL: redis://localhost:6379/0

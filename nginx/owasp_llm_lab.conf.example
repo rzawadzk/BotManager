@@ -2,8 +2,10 @@
 # OWASP LLM Top 10 Lab — Nginx site config (with Bot Engine integration)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Drop this into /etc/nginx/sites-available/ and symlink into sites-enabled.
-# Assumes bot_engine.conf (upstream definitions + auth endpoint) is already
-# loaded via /etc/nginx/conf.d/.
+# Assumes bot_engine.conf (upstream definitions + auth endpoint + the
+# `bot_auth_cache` proxy_cache_path and the `$bot_auth_no_cache` map) is
+# already loaded via /etc/nginx/conf.d/. The cache zone must live in the
+# http context, not the server block.
 #
 # Before enabling TLS:
 #   1. Point your domain (e.g. llm-lab.example.com) at this server

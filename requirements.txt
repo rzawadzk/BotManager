@@ -25,3 +25,14 @@ uvicorn[standard]>=0.27.0
 # ── Dashboard (optional extras) ──
 # python-multipart is needed for FastAPI form handling
 python-multipart>=0.0.6
+
+# ── State backend (optional — enable with STATE_BACKEND: redis) ──
+# Redis is used for shared session/rate/challenge state across multiple
+# scoring engine nodes. If unavailable, the engine falls back to in-memory
+# with a stderr warning (requests still scored, state just not shared).
+redis>=5.0.0
+
+# ── Test-only ──
+# fakeredis mocks a Redis server in-process for the C1 test suite.
+# Only needed when running `pytest`.
+fakeredis>=2.20.0

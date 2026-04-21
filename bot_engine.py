@@ -157,6 +157,14 @@ CONFIG = {
     # length anomalies. Called synchronously by the LLM proxy backend
     # before forwarding to the model.
     "PROMPT_INJECTION_ENABLED": True,
+
+    # ── State backend (C1.2) ──
+    # "memory" (default) — single-node in-process state
+    # "redis" — shared state across scoring engine nodes via Redis. Requires
+    #           REDIS_URL to be set and `pip install redis`. Falls back to
+    #           "memory" if redis is unreachable at startup (fail-open).
+    "STATE_BACKEND": os.environ.get("BOT_STATE_BACKEND", "memory"),
+    "REDIS_URL": os.environ.get("BOT_REDIS_URL", "redis://localhost:6379/0"),
 }
 
 
@@ -1318,15 +1326,47 @@ class BotScoringEngine:
         # Subsystems
         self.drdns = DrDNSVerifier(cache_ttl=self.config["DRDNS_CACHE_TTL"])
         self.ml_scorer = MLScorer(model_path=self.config["ONNX_MODEL_PATH"])
-        self.session_tracker = SessionTracker(
-            window_seconds=self.config["SESSION_WINDOW_SECONDS"]
-        )
+
+        # Session tracker — in-memory by default, Redis if configured (C1.2).
+        # Both backends implement the same public interface so the rest of
+        # the engine doesn't care which one we got.
+        self.session_tracker = self._build_session_tracker()
         self.agentic_detector = AgenticAIDetector(
             jitter_threshold=self.config["MICRO_JITTER_THRESHOLD"],
             drip_delay_ms=self.config["DRIP_CHALLENGE_DELAY_MS"],
         )
         self.deception = DeceptionEngine(
             honeypot_paths=self.config.get("HONEYPOT_PATHS")
+        )
+
+    def _build_session_tracker(self):
+        """Build the session tracker, preferring Redis when configured.
+
+        Returns an object implementing SessionTracker's public interface.
+        Falls back to the in-memory implementation on any Redis failure —
+        the engine never fails closed because the state backend is down.
+        """
+        if self.config.get("STATE_BACKEND") == "redis":
+            try:
+                from redis_state import build_redis_client, RedisSessionTracker
+                client = build_redis_client(
+                    self.config.get("REDIS_URL", "redis://localhost:6379/0"),
+                )
+                return RedisSessionTracker(
+                    client,
+                    window_seconds=self.config["SESSION_WINDOW_SECONDS"],
+                )
+            except Exception as exc:
+                # Log to stderr so ops can see the fallback. Don't use a
+                # logger here because we may be pre-logging-setup.
+                import sys
+                print(
+                    f"[bot_engine] Redis session tracker unavailable ({exc}); "
+                    f"falling back to in-memory",
+                    file=sys.stderr,
+                )
+        return SessionTracker(
+            window_seconds=self.config["SESSION_WINDOW_SECONDS"]
         )
 
     def evaluate(self, req: RequestSignals) -> ThreatScore:

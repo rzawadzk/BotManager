@@ -450,13 +450,14 @@ class RealtimeScoringServer:
         self.engine = BotScoringEngine()
         self._load_persisted_scores()
         self.metrics = Metrics()
-        self.rate_tracker = RateTracker(window_seconds=10)
-        # Separate rate tracker for challenge/captcha endpoints (5 attempts per 60s)
+        # Rate trackers + challenge store: Redis-backed if configured
+        # (C1.2), in-memory otherwise. Factory returns None on any failure
+        # so we fall back to in-memory without blocking startup.
+        self.rate_tracker, self.challenges = self._build_shared_state()
+        # Challenge/captcha endpoint rate limiter stays in-memory — it's
+        # a per-node anti-abuse counter that doesn't need cross-node sync.
         self._challenge_rate = RateTracker(window_seconds=60, max_ips=50_000)
         self._challenge_rate_limit = 5
-        self.challenges = ChallengeStore(
-            ttl=self.config["CHALLENGE_COOKIE_TTL"]
-        )
 
         # ── PoW engine (multi-batch) ──
         self.pow_engine: Optional[ProofOfWorkEngine] = None
@@ -495,6 +496,42 @@ class RealtimeScoringServer:
 
         self._running = False
         self._server = None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # State backend construction
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _build_shared_state(self):
+        """Build (rate_tracker, challenge_store), Redis-backed if configured.
+
+        Redis mode: cross-node shared state so a request hitting node A
+        counts against rate/challenge budgets even if prior requests hit
+        node B. Falls back to in-memory on any Redis failure — fail-open.
+        """
+        if CONFIG.get("STATE_BACKEND") == "redis":
+            try:
+                from redis_state import (
+                    build_redis_client, RedisRateTracker, RedisChallengeStore,
+                )
+                client = build_redis_client(
+                    CONFIG.get("REDIS_URL", "redis://localhost:6379/0"),
+                )
+                return (
+                    RedisRateTracker(client, window_seconds=10),
+                    RedisChallengeStore(
+                        client, ttl=self.config["CHALLENGE_COOKIE_TTL"],
+                    ),
+                )
+            except Exception as exc:
+                print(
+                    f"[realtime_server] Redis shared state unavailable "
+                    f"({exc}); falling back to in-memory",
+                    file=sys.stderr,
+                )
+        return (
+            RateTracker(window_seconds=10),
+            ChallengeStore(ttl=self.config["CHALLENGE_COOKIE_TTL"]),
+        )
 
     # ──────────────────────────────────────────────────────────────────────────
     # State recovery
@@ -964,6 +1001,15 @@ class RealtimeScoringServer:
             "X-Bot-Action": action,
             "X-Bot-Classification": classification,
         }
+
+        # Cache-Control hints: let nginx and any upstream CDN cache
+        # "allow" verdicts for 60s (C1.1), but never cache
+        # suspect/block/challenge. The nginx bot_auth_cache also enforces
+        # this via the $bot_auth_no_cache map, keyed off X-Bot-Action.
+        if action == "allow" and status_code == 200:
+            headers["Cache-Control"] = "private, max-age=60"
+        else:
+            headers["Cache-Control"] = "no-store"
 
         if action == "challenge":
             headers["X-Challenge-Redirect"] = self.config["CHALLENGE_PATH"]
