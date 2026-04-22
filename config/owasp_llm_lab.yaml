@@ -82,7 +82,7 @@ TOOLING_UA_STATIC_DISCOUNT: 25
 TOOLING_UA_API_BONUS: 70
 
 # ── Canary endpoints (P1 #8) ──
-# Dead-code references in static/bot_canary.js. A browser never hits these;
+# Dead-code references in static/js/src/bot_canary.js. A browser never hits these;
 # a JS-scraping bot will, and gets scored 100 immediately.
 CANARY_PATHS:
   - /api/v2/_internal/models_internal

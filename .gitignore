@@ -6,3 +6,11 @@ __pycache__/
 *.db
 *.sock
 .claude/
+
+# ── Node (C3 #9 terser build) ──
+# Minified JS is committed (static/js/dist/*.min.js) so a fresh clone can
+# serve the optimised bundle without running npm. Only the tooling and
+# source maps stay out of the repo.
+node_modules/
+package-lock.json
+static/js/dist/*.map

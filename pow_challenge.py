@@ -577,402 +577,116 @@ def generate_challenge_html(
       4. Simultaneously collects telemetry
       5. POSTs all nonces + telemetry to the verification endpoint
       6. On success, sets cookie and redirects
+
+    The JavaScript lives in ``static/js/src/pow_worker.js`` and
+    ``static/js/src/pow_challenge.js`` and is loaded via ``js_assets``;
+    the values that change per challenge (challenge_id, batches,
+    redirect, telemetry window) travel through a single JSON script
+    block so we never have to str.format the JS itself. That means
+    terser's output lands here byte-for-byte unmodified (C3 #9).
     """
-    # Serialise batches to JSON for embedding in the page
-    batches_json = json.dumps([
-        {
-            "batch_index": b.batch_index,
-            "prefix": b.prefix,
-            "difficulty": b.difficulty,
-        }
-        for b in challenge.batches
-    ])
+    from js_assets import POW_WORKER_JS, POW_CHALLENGE_JS
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Verifying your browser</title>
-<style>
-  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    display: flex; justify-content: center; align-items: center;
-    min-height: 100vh; background: #f8f9fa; color: #333;
-  }}
-  .card {{
-    background: white; border-radius: 12px; padding: 48px;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.10); text-align: center;
-    max-width: 460px; width: 92%;
-  }}
-  .spinner {{
-    width: 48px; height: 48px; margin: 0 auto 24px;
-    border: 4px solid #e9ecef; border-top-color: #495057;
-    border-radius: 50%; animation: spin 0.8s linear infinite;
-  }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  h2 {{ font-size: 18px; font-weight: 600; margin-bottom: 8px; }}
-  p.desc {{ font-size: 14px; color: #6c757d; line-height: 1.5; }}
-  .progress-outer {{
-    margin-top: 24px; height: 6px; background: #e9ecef;
-    border-radius: 3px; overflow: hidden;
-  }}
-  .progress-bar {{
-    height: 100%; width: 0%; background: linear-gradient(90deg, #495057, #6c757d);
-    transition: width 0.3s ease;
-  }}
-  .batch-label {{
-    margin-top: 10px; font-size: 13px; color: #868e96; font-weight: 500;
-  }}
-  .status {{ margin-top: 8px; font-size: 12px; color: #adb5bd; }}
-  .error {{ color: #dc3545; }}
-  .success {{ color: #28a745; }}
-  noscript p {{ color: #dc3545; font-weight: 500; }}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="spinner" id="spinner"></div>
-  <h2>Verifying your browser</h2>
-  <p class="desc">This is a one-time security check. It should complete in a few seconds.</p>
-  <div class="progress-outer"><div class="progress-bar" id="progress"></div></div>
-  <div class="batch-label" id="batchLabel">Preparing puzzles...</div>
-  <div class="status" id="status">Initializing...</div>
-  <noscript><p>JavaScript is required to verify your browser.</p></noscript>
-</div>
+    # Per-challenge config → JSON document in a <script type="application/json">
+    # block. Using JSON (not f-string interpolation into JS) sidesteps
+    # every escape hazard: the challenge_id can contain any character
+    # json.dumps knows how to escape, and it still parses as data rather
+    # than code. The one edge we handle explicitly is ``</script`` — if
+    # a field value contains it, the browser would end the <script> tag
+    # early. Replace ``</`` with ``<\/`` so the HTML parser sees nothing
+    # script-like.
+    config_payload = {
+        "challenge_id": challenge.challenge_id,
+        "batches": [
+            {
+                "batch_index": b.batch_index,
+                "prefix": b.prefix,
+                "difficulty": b.difficulty,
+            }
+            for b in challenge.batches
+        ],
+        "redirect": redirect_url,
+        "collect_ms": telemetry_collect_ms,
+    }
+    config_json = json.dumps(config_payload).replace("</", "<\\/")
 
-<!-- Web Worker for sequential multi-batch PoW -->
-<script id="worker-src" type="text/js-worker">
-  const K = new Uint32Array([
-    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-  ]);
+    # Inline CSS kept here (not f-string-interpolated) so we never have
+    # to double brace `{ }` in the style rules. The CSS is small enough
+    # that inlining beats a separate round-trip for the challenge page.
+    style = (
+        "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
+        "body {"
+        "  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;"
+        "  display: flex; justify-content: center; align-items: center;"
+        "  min-height: 100vh; background: #f8f9fa; color: #333;"
+        "}"
+        ".card {"
+        "  background: white; border-radius: 12px; padding: 48px;"
+        "  box-shadow: 0 4px 24px rgba(0,0,0,0.10); text-align: center;"
+        "  max-width: 460px; width: 92%;"
+        "}"
+        ".spinner {"
+        "  width: 48px; height: 48px; margin: 0 auto 24px;"
+        "  border: 4px solid #e9ecef; border-top-color: #495057;"
+        "  border-radius: 50%; animation: spin 0.8s linear infinite;"
+        "}"
+        "@keyframes spin { to { transform: rotate(360deg); } }"
+        "h2 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }"
+        "p.desc { font-size: 14px; color: #6c757d; line-height: 1.5; }"
+        ".progress-outer {"
+        "  margin-top: 24px; height: 6px; background: #e9ecef;"
+        "  border-radius: 3px; overflow: hidden;"
+        "}"
+        ".progress-bar {"
+        "  height: 100%; width: 0%;"
+        "  background: linear-gradient(90deg, #495057, #6c757d);"
+        "  transition: width 0.3s ease;"
+        "}"
+        ".batch-label { margin-top: 10px; font-size: 13px; color: #868e96; font-weight: 500; }"
+        ".status { margin-top: 8px; font-size: 12px; color: #adb5bd; }"
+        ".error { color: #dc3545; }"
+        ".success { color: #28a745; }"
+        "noscript p { color: #dc3545; font-weight: 500; }"
+    )
 
-  function sha256(msg) {{
-    const msgLen = msg.length;
-    const bitLen = msgLen * 8;
-    const padLen = ((msgLen + 9 + 63) & ~63);
-    const buf = new Uint8Array(padLen);
-    for (let i = 0; i < msgLen; i++) buf[i] = msg.charCodeAt(i);
-    buf[msgLen] = 0x80;
-    const view = new DataView(buf.buffer);
-    view.setUint32(padLen - 4, bitLen, false);
+    body = (
+        '<div class="card">'
+        '  <div class="spinner" id="spinner"></div>'
+        "  <h2>Verifying your browser</h2>"
+        '  <p class="desc">This is a one-time security check. It should complete in a few seconds.</p>'
+        '  <div class="progress-outer"><div class="progress-bar" id="progress"></div></div>'
+        '  <div class="batch-label" id="batchLabel">Preparing puzzles...</div>'
+        '  <div class="status" id="status">Initializing...</div>'
+        "  <noscript><p>JavaScript is required to verify your browser.</p></noscript>"
+        "</div>"
+    )
 
-    let h0=0x6a09e667, h1=0xbb67ae85, h2=0x3c6ef372, h3=0xa54ff53a;
-    let h4=0x510e527f, h5=0x9b05688c, h6=0x1f83d9ab, h7=0x5be0cd19;
-    const w = new Uint32Array(64);
+    # Assembly: HTML shell + config JSON + worker body (as a <script
+    # type="text/js-worker"> so the browser won't execute it inline;
+    # pow_challenge.js reads its textContent and spawns a Blob worker)
+    # + the orchestrator itself.
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en"><head>'
+        '<meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Verifying your browser</title>"
+        f"<style>{style}</style>"
+        "</head><body>"
+        f"{body}"
+        '<script id="challenge-config" type="application/json">'
+        f"{config_json}"
+        "</script>"
+        '<script id="worker-src" type="text/js-worker">\n'
+        f"{POW_WORKER_JS}"
+        "\n</script>"
+        "<script>\n"
+        f"{POW_CHALLENGE_JS}"
+        "\n</script>"
+        "</body></html>"
+    )
 
-    for (let off = 0; off < padLen; off += 64) {{
-      for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i*4, false);
-      for (let i = 16; i < 64; i++) {{
-        const s0 = (w[i-15]>>>7 | w[i-15]<<25) ^ (w[i-15]>>>18 | w[i-15]<<14) ^ (w[i-15]>>>3);
-        const s1 = (w[i-2]>>>17 | w[i-2]<<15) ^ (w[i-2]>>>19 | w[i-2]<<13) ^ (w[i-2]>>>10);
-        w[i] = (w[i-16] + s0 + w[i-7] + s1) | 0;
-      }}
-      let a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
-      for (let i = 0; i < 64; i++) {{
-        const S1 = (e>>>6|e<<26)^(e>>>11|e<<21)^(e>>>25|e<<7);
-        const ch = (e&f)^(~e&g);
-        const t1 = (h+S1+ch+K[i]+w[i])|0;
-        const S0 = (a>>>2|a<<30)^(a>>>13|a<<19)^(a>>>22|a<<10);
-        const maj = (a&b)^(a&c)^(b&c);
-        const t2 = (S0+maj)|0;
-        h=g; g=f; f=e; e=(d+t1)|0; d=c; c=b; b=a; a=(t1+t2)|0;
-      }}
-      h0=(h0+a)|0; h1=(h1+b)|0; h2=(h2+c)|0; h3=(h3+d)|0;
-      h4=(h4+e)|0; h5=(h5+f)|0; h6=(h6+g)|0; h7=(h7+h)|0;
-    }}
-    return [h0,h1,h2,h3,h4,h5,h6,h7];
-  }}
 
-  function sha256hex(msg) {{
-    const h = sha256(msg);
-    let out = "";
-    for (let i = 0; i < 8; i++) {{
-      out += ("00000000" + (h[i]>>>0).toString(16)).slice(-8);
-    }}
-    return out;
-  }}
-
-  function checkLeadingZeros(hash, bits) {{
-    const fullBytes = bits >> 3;
-    const remBits = bits & 7;
-    for (let i = 0; i < fullBytes; i++) {{
-      const byte = (hash[i>>2] >>> (24 - (i&3)*8)) & 0xFF;
-      if (byte !== 0) return false;
-    }}
-    if (remBits > 0) {{
-      const byte = (hash[fullBytes>>2] >>> (24 - (fullBytes&3)*8)) & 0xFF;
-      if ((byte & (0xFF << (8 - remBits))) !== 0) return false;
-    }}
-    return true;
-  }}
-
-  self.onmessage = function(e) {{
-    const batches = e.data.batches;
-    const totalBatches = batches.length;
-    const startTime = Date.now();
-    const nonces = [];
-    let runningSalt = "";
-
-    function solveBatch(batchIdx) {{
-      if (batchIdx >= totalBatches) {{
-        self.postMessage({{
-          done: true,
-          nonces: nonces,
-          elapsed: Date.now() - startTime,
-        }});
-        return;
-      }}
-
-      const batch = batches[batchIdx];
-      const prefix = batch.prefix;
-      const difficulty = batch.difficulty;
-      let nonce = 0;
-      const batchSize = 5000;
-
-      function solveChunk() {{
-        for (let i = 0; i < batchSize; i++) {{
-          const candidate = prefix + runningSalt + nonce.toString(16);
-          const hash = sha256(candidate);
-          if (checkLeadingZeros(hash, difficulty)) {{
-            const foundNonce = nonce.toString(16);
-            nonces.push(foundNonce);
-            // Compute running salt for next batch
-            runningSalt = sha256hex(candidate);
-            self.postMessage({{
-              done: false,
-              batchDone: true,
-              batchIndex: batchIdx,
-              totalBatches: totalBatches,
-              nonce: foundNonce,
-              elapsed: Date.now() - startTime,
-            }});
-            setTimeout(function() {{ solveBatch(batchIdx + 1); }}, 0);
-            return;
-          }}
-          nonce++;
-        }}
-        self.postMessage({{
-          done: false,
-          batchDone: false,
-          batchIndex: batchIdx,
-          totalBatches: totalBatches,
-          hashes: nonce,
-          elapsed: Date.now() - startTime,
-        }});
-        setTimeout(solveChunk, 0);
-      }}
-      solveChunk();
-    }}
-    solveBatch(0);
-  }};
-</script>
-
-<!-- Main script: orchestrates multi-batch PoW + telemetry -->
-<script>
-(function() {{
-  "use strict";
-
-  var CHALLENGE_ID = "{challenge.challenge_id}";
-  var BATCHES = {batches_json};
-  var REDIRECT = "{redirect_url}";
-  var COLLECT_MS = {telemetry_collect_ms};
-  var BEACON_URL = "/_bot_challenge";
-
-  var progress = document.getElementById("progress");
-  var status = document.getElementById("status");
-  var batchLabel = document.getElementById("batchLabel");
-  var spinner = document.getElementById("spinner");
-
-  // ── Telemetry collection (runs in parallel with PoW) ──
-  var telemetry = {{
-    ts: Date.now(),
-    webdriver: !!navigator.webdriver,
-    plugins: navigator.plugins ? navigator.plugins.length : 0,
-    languages: navigator.languages ? Array.from(navigator.languages) : [],
-    platform: navigator.platform || "",
-    hwConcurrency: navigator.hardwareConcurrency || 0,
-    deviceMemory: navigator.deviceMemory || null,
-    maxTouchPoints: navigator.maxTouchPoints || 0,
-    screenW: screen.width, screenH: screen.height,
-    colorDepth: screen.colorDepth,
-    outerW: window.outerWidth, outerH: window.outerHeight,
-    dpr: window.devicePixelRatio || 1,
-    perfRes: 0, rafAvg: 0, rafStd: 0,
-    canvasHash: "", webglRenderer: "", webglVendor: "",
-    mouseMoves: [], mouseClicks: [], scrollEvents: [], keyCount: 0,
-    apis: [],
-    notifPerm: "",
-  }};
-
-  var t1 = performance.now(), t2 = performance.now();
-  telemetry.perfRes = t2 - t1;
-
-  var rafTs = []; var rafN = 0;
-  function mRAF(ts) {{ rafTs.push(ts); if (++rafN < 30) requestAnimationFrame(mRAF); }}
-  requestAnimationFrame(mRAF);
-
-  try {{
-    var c = document.createElement("canvas"); c.width=256; c.height=64;
-    var x = c.getContext("2d");
-    x.textBaseline="top"; x.font="14px Arial";
-    x.fillStyle="#f60"; x.fillRect(125,1,62,20);
-    x.fillStyle="#069"; x.fillText("BotCk,.+@#$",2,15);
-    x.fillStyle="rgba(102,204,0,0.7)"; x.fillText("BotCk,.+@#$",4,17);
-    x.globalCompositeOperation="multiply";
-    x.fillStyle="rgb(255,0,255)"; x.beginPath(); x.arc(50,50,50,0,Math.PI*2,true); x.fill();
-    var hv=0; var d=c.toDataURL();
-    for(var i=0;i<d.length;i++) {{ hv=((hv<<5)-hv)+d.charCodeAt(i); hv|=0; }}
-    telemetry.canvasHash = hv.toString(16);
-  }} catch(e) {{}}
-
-  try {{
-    var c2 = document.createElement("canvas");
-    var gl = c2.getContext("webgl")||c2.getContext("experimental-webgl");
-    if (gl) {{
-      var dbg = gl.getExtension("WEBGL_debug_renderer_info");
-      if (dbg) {{
-        telemetry.webglRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)||"";
-        telemetry.webglVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL)||"";
-      }}
-    }}
-  }} catch(e) {{}}
-
-  document.addEventListener("mousemove", function(e) {{
-    if (telemetry.mouseMoves.length < 200)
-      telemetry.mouseMoves.push([e.clientX, e.clientY, e.timeStamp|0]);
-  }});
-  document.addEventListener("click", function(e) {{
-    telemetry.mouseClicks.push([e.clientX, e.clientY, e.timeStamp|0]);
-  }});
-  document.addEventListener("scroll", function() {{
-    telemetry.scrollEvents.push([window.scrollY, Date.now()]);
-  }});
-  document.addEventListener("keydown", function() {{ telemetry.keyCount++; }});
-
-  if (navigator.permissions) {{
-    navigator.permissions.query({{name:"notifications"}}).then(function(r) {{
-      telemetry.notifPerm = r.state;
-    }}).catch(function(){{}});
-  }}
-
-  ["Bluetooth","BatteryManager","Gamepad","MediaDevices","Credential",
-   "PaymentRequest","Presentation","WakeLock","USB","Serial","HID","XRSystem"
-  ].forEach(function(a) {{ if (a in window || a in navigator) telemetry.apis.push(a); }});
-
-  // ── Start Web Worker ──
-  status.textContent = "Solving puzzles...";
-  batchLabel.textContent = "Solving puzzle 1 of " + BATCHES.length + "...";
-
-  var workerSrc = document.getElementById("worker-src").textContent;
-  var blob = new Blob([workerSrc], {{type: "application/javascript"}});
-  var worker = new Worker(URL.createObjectURL(blob));
-
-  var solved = false;
-  var solvedNonces = [];
-  var solveElapsed = 0;
-
-  worker.onmessage = function(e) {{
-    var msg = e.data;
-
-    if (msg.done) {{
-      solved = true;
-      solvedNonces = msg.nonces;
-      solveElapsed = msg.elapsed;
-      progress.style.width = "100%";
-      batchLabel.textContent = "All puzzles solved!";
-      status.textContent = "Verified! Redirecting...";
-      status.className = "status success";
-      spinner.style.borderTopColor = "#28a745";
-      worker.terminate();
-      submitResult();
-    }} else if (msg.batchDone) {{
-      var pct = ((msg.batchIndex + 1) / msg.totalBatches) * 100;
-      progress.style.width = pct + "%";
-      batchLabel.textContent = "Solved puzzle " + (msg.batchIndex + 1) + " of " + msg.totalBatches;
-      if (msg.batchIndex + 1 < msg.totalBatches) {{
-        status.textContent = "Starting puzzle " + (msg.batchIndex + 2) + "...";
-      }}
-    }} else {{
-      var basePct = (msg.batchIndex / msg.totalBatches) * 100;
-      var expectedHashes = Math.pow(2, BATCHES[msg.batchIndex].difficulty);
-      var inBatchPct = Math.min(0.95, msg.hashes / expectedHashes);
-      var totalPct = basePct + inBatchPct * (100 / msg.totalBatches);
-      progress.style.width = Math.min(95, totalPct) + "%";
-      batchLabel.textContent = "Solving puzzle " + (msg.batchIndex + 1) + " of " + msg.totalBatches + "...";
-      var rate = msg.hashes / (msg.elapsed / 1000);
-      status.textContent = "Working... " + (rate/1000|0) + "k hashes/s";
-    }}
-  }};
-
-  worker.postMessage({{ batches: BATCHES }});
-
-  // ── Submit all nonces + telemetry ──
-  function submitResult() {{
-    if (rafTs.length > 2) {{
-      var intervals = [];
-      for (var i=1; i<rafTs.length; i++) intervals.push(rafTs[i]-rafTs[i-1]);
-      var sum = intervals.reduce(function(a,b){{return a+b;}},0);
-      telemetry.rafAvg = sum/intervals.length;
-      var sq = intervals.reduce(function(a,b){{return a+Math.pow(b-telemetry.rafAvg,2);}},0);
-      telemetry.rafStd = Math.sqrt(sq/intervals.length);
-    }}
-
-    var payload = {{
-      challenge_id: CHALLENGE_ID,
-      nonces: solvedNonces,
-      solve_time_ms: solveElapsed,
-      telemetry: telemetry,
-    }};
-
-    fetch(BEACON_URL, {{
-      method: "POST",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify(payload),
-      credentials: "same-origin",
-    }})
-    .then(function(resp) {{
-      if (resp.ok) return resp.json();
-      throw new Error("Verification failed");
-    }})
-    .then(function(data) {{
-      if (data.verified) {{
-        setTimeout(function() {{ window.location.href = REDIRECT; }}, 300);
-      }} else {{
-        status.textContent = "Verification failed. Retrying...";
-        status.className = "status error";
-        setTimeout(function() {{ window.location.reload(); }}, 2000);
-      }}
-    }})
-    .catch(function(err) {{
-      status.textContent = "Error: " + err.message;
-      status.className = "status error";
-      setTimeout(function() {{ window.location.reload(); }}, 3000);
-    }});
-  }}
-
-  // ── Timeout fallback ──
-  setTimeout(function() {{
-    if (!solved) {{
-      worker.terminate();
-      status.textContent = "Challenge timeout. Reloading...";
-      status.className = "status error";
-      setTimeout(function() {{ window.location.reload(); }}, 2000);
-    }}
-  }}, 30000);
-
-}})();
-</script>
-</body>
-</html>"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1308,231 +1022,88 @@ class BiometricCaptcha:
 
     @staticmethod
     def _render_captcha_html(captcha_id: str, points_json: str) -> str:
-        """Render the full HTML for the biometric captcha page."""
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Security Verification</title>
-<style>
-  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    display: flex; justify-content: center; align-items: center;
-    min-height: 100vh; background: #f8f9fa; color: #333;
-  }}
-  .card {{
-    background: white; border-radius: 12px; padding: 36px;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.10); text-align: center;
-    max-width: 500px; width: 94%;
-  }}
-  h2 {{ font-size: 18px; font-weight: 600; margin-bottom: 8px; }}
-  p.desc {{ font-size: 14px; color: #6c757d; line-height: 1.5; margin-bottom: 16px; }}
-  canvas {{
-    border: 2px solid #dee2e6; border-radius: 8px;
-    cursor: crosshair; display: block; margin: 0 auto;
-    touch-action: none;
-  }}
-  .btn {{
-    margin-top: 16px; padding: 10px 32px; border: none; border-radius: 6px;
-    background: #495057; color: white; font-size: 14px; font-weight: 500;
-    cursor: pointer; transition: background 0.2s;
-  }}
-  .btn:hover {{ background: #343a40; }}
-  .btn:disabled {{ background: #adb5bd; cursor: not-allowed; }}
-  .status {{ margin-top: 10px; font-size: 12px; color: #adb5bd; min-height: 18px; }}
-  .error {{ color: #dc3545; }}
-  .success {{ color: #28a745; }}
-</style>
-</head>
-<body>
-<div class="card">
-  <h2>Trace the path below</h2>
-  <p class="desc">Use your mouse or finger to trace along the highlighted curve.</p>
-  <canvas id="captchaCanvas" width="400" height="300"></canvas>
-  <button class="btn" id="submitBtn" disabled>Submit</button>
-  <div class="status" id="status"></div>
-</div>
+        """Render the full HTML for the biometric captcha page.
 
-<script>
-(function() {{
-  "use strict";
+        The JavaScript lives in ``static/js/src/captcha.js`` and is loaded
+        via ``js_assets``; the per-captcha config (captcha_id, curve
+        points) travels through a JSON script block so we never have to
+        str.format JS source (C3 #9).
+        """
+        from js_assets import CAPTCHA_JS
 
-  var CAPTCHA_ID = "{captcha_id}";
-  var POINTS = {points_json};
-  var BEACON_URL = "/_bot_captcha";
+        # points_json arrives as a serialised JSON string already (the
+        # caller built it with json.dumps(curve_points)). Parse and
+        # re-serialise alongside captcha_id so the config block is a
+        # single well-formed JSON document.
+        try:
+            points = json.loads(points_json)
+        except (TypeError, ValueError):
+            points = []
+        config_json = json.dumps({
+            "captcha_id": captcha_id,
+            "points": points,
+        }).replace("</", "<\\/")
 
-  var canvas = document.getElementById("captchaCanvas");
-  var ctx = canvas.getContext("2d");
-  var submitBtn = document.getElementById("submitBtn");
-  var statusEl = document.getElementById("status");
-  var traceData = [];
-  var isTracing = false;
-  var hasStarted = false;
+        style = (
+            "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
+            "body {"
+            "  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;"
+            "  display: flex; justify-content: center; align-items: center;"
+            "  min-height: 100vh; background: #f8f9fa; color: #333;"
+            "}"
+            ".card {"
+            "  background: white; border-radius: 12px; padding: 36px;"
+            "  box-shadow: 0 4px 24px rgba(0,0,0,0.10); text-align: center;"
+            "  max-width: 500px; width: 94%;"
+            "}"
+            "h2 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }"
+            "p.desc { font-size: 14px; color: #6c757d; line-height: 1.5; margin-bottom: 16px; }"
+            "canvas {"
+            "  border: 2px solid #dee2e6; border-radius: 8px;"
+            "  cursor: crosshair; display: block; margin: 0 auto;"
+            "  touch-action: none;"
+            "}"
+            ".btn {"
+            "  margin-top: 16px; padding: 10px 32px; border: none; border-radius: 6px;"
+            "  background: #495057; color: white; font-size: 14px; font-weight: 500;"
+            "  cursor: pointer; transition: background 0.2s;"
+            "}"
+            ".btn:hover { background: #343a40; }"
+            ".btn:disabled { background: #adb5bd; cursor: not-allowed; }"
+            ".status { margin-top: 10px; font-size: 12px; color: #adb5bd; min-height: 18px; }"
+            ".error { color: #dc3545; }"
+            ".success { color: #28a745; }"
+        )
 
-  // ── Draw the Bezier curve ──
-  function drawCurve() {{
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    // Background
-    ctx.fillStyle = "#f8f9fa";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+        body = (
+            '<div class="card">'
+            "<h2>Trace the path below</h2>"
+            '<p class="desc">Use your mouse or finger to trace along the highlighted curve.</p>'
+            '<canvas id="captchaCanvas" width="400" height="300"></canvas>'
+            '<button class="btn" id="submitBtn" disabled>Submit</button>'
+            '<div class="status" id="status"></div>'
+            "</div>"
+        )
 
-    // Animated dashed guide
-    ctx.beginPath();
-    ctx.moveTo(POINTS[0].x, POINTS[0].y);
-    ctx.bezierCurveTo(
-      POINTS[1].x, POINTS[1].y,
-      POINTS[2].x, POINTS[2].y,
-      POINTS[3].x, POINTS[3].y
-    );
-    ctx.strokeStyle = "#adb5bd";
-    ctx.lineWidth = 3;
-    ctx.setLineDash([8, 6]);
-    ctx.stroke();
-    ctx.setLineDash([]);
+        return (
+            "<!DOCTYPE html>"
+            '<html lang="en"><head>'
+            '<meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            "<title>Security Verification</title>"
+            f"<style>{style}</style>"
+            "</head><body>"
+            f"{body}"
+            '<script id="captcha-config" type="application/json">'
+            f"{config_json}"
+            "</script>"
+            "<script>\n"
+            f"{CAPTCHA_JS}"
+            "\n</script>"
+            "</body></html>"
+        )
 
-    // Solid thicker guide
-    ctx.beginPath();
-    ctx.moveTo(POINTS[0].x, POINTS[0].y);
-    ctx.bezierCurveTo(
-      POINTS[1].x, POINTS[1].y,
-      POINTS[2].x, POINTS[2].y,
-      POINTS[3].x, POINTS[3].y
-    );
-    ctx.strokeStyle = "rgba(73, 80, 87, 0.25)";
-    ctx.lineWidth = 24;
-    ctx.lineCap = "round";
-    ctx.stroke();
 
-    // Start/end markers
-    ctx.beginPath();
-    ctx.arc(POINTS[0].x, POINTS[0].y, 8, 0, Math.PI*2);
-    ctx.fillStyle = "#28a745";
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(POINTS[3].x, POINTS[3].y, 8, 0, Math.PI*2);
-    ctx.fillStyle = "#dc3545";
-    ctx.fill();
-  }}
-
-  // ── Draw user trace ──
-  function drawTrace() {{
-    if (traceData.length < 2) return;
-    ctx.beginPath();
-    ctx.moveTo(traceData[0].x, traceData[0].y);
-    for (var i = 1; i < traceData.length; i++) {{
-      ctx.lineTo(traceData[i].x, traceData[i].y);
-    }}
-    ctx.strokeStyle = "#495057";
-    ctx.lineWidth = 3;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.stroke();
-  }}
-
-  function getPos(e) {{
-    var rect = canvas.getBoundingClientRect();
-    var clientX, clientY, pressure;
-    if (e.touches && e.touches.length > 0) {{
-      clientX = e.touches[0].clientX;
-      clientY = e.touches[0].clientY;
-      pressure = e.touches[0].force || 0;
-    }} else {{
-      clientX = e.clientX;
-      clientY = e.clientY;
-      pressure = e.pressure || 0;
-    }}
-    return {{
-      x: clientX - rect.left,
-      y: clientY - rect.top,
-      t: Date.now(),
-      pressure: pressure,
-    }};
-  }}
-
-  function onStart(e) {{
-    e.preventDefault();
-    isTracing = true;
-    if (!hasStarted) {{
-      hasStarted = true;
-      traceData = [];
-    }}
-    var pos = getPos(e);
-    traceData.push(pos);
-  }}
-
-  function onMove(e) {{
-    e.preventDefault();
-    if (!isTracing) return;
-    var pos = getPos(e);
-    traceData.push(pos);
-    drawCurve();
-    drawTrace();
-  }}
-
-  function onEnd(e) {{
-    e.preventDefault();
-    isTracing = false;
-    if (traceData.length > 5) {{
-      submitBtn.disabled = false;
-    }}
-  }}
-
-  canvas.addEventListener("mousedown", onStart);
-  canvas.addEventListener("mousemove", onMove);
-  canvas.addEventListener("mouseup", onEnd);
-  canvas.addEventListener("mouseleave", onEnd);
-  canvas.addEventListener("touchstart", onStart, {{passive: false}});
-  canvas.addEventListener("touchmove", onMove, {{passive: false}});
-  canvas.addEventListener("touchend", onEnd, {{passive: false}});
-  canvas.addEventListener("touchcancel", onEnd, {{passive: false}});
-
-  submitBtn.addEventListener("click", function() {{
-    submitBtn.disabled = true;
-    statusEl.textContent = "Verifying...";
-
-    fetch(BEACON_URL, {{
-      method: "POST",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{
-        captcha_id: CAPTCHA_ID,
-        trace_data: traceData,
-      }}),
-      credentials: "same-origin",
-    }})
-    .then(function(resp) {{
-      if (resp.ok) return resp.json();
-      throw new Error("Verification failed");
-    }})
-    .then(function(data) {{
-      if (data.passed) {{
-        statusEl.textContent = "Verified!";
-        statusEl.className = "status success";
-      }} else {{
-        statusEl.textContent = "Please try again.";
-        statusEl.className = "status error";
-        traceData = [];
-        hasStarted = false;
-        drawCurve();
-        setTimeout(function() {{
-          submitBtn.disabled = false;
-          statusEl.textContent = "";
-          statusEl.className = "status";
-        }}, 1500);
-      }}
-    }})
-    .catch(function(err) {{
-      statusEl.textContent = "Error: " + err.message;
-      statusEl.className = "status error";
-    }});
-  }});
-
-  drawCurve();
-}})();
-</script>
-</body>
-</html>"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

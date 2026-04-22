@@ -94,6 +94,7 @@ try:
         BlocklistWriter, CONFIG, GOOD_BOT_UAS, load_config_file,
         PromptInjectionDetector, ip_bucket,
     )
+    from db_worker import DbWriteQueue
 except ImportError:
     print("ERROR: bot_engine.py must be in the same directory or on PYTHONPATH")
     sys.exit(1)
@@ -148,6 +149,11 @@ SERVER_CONFIG = {
     # ── Persistence ──
     "SNAPSHOT_INTERVAL": 300,
     "DB_PATH": CONFIG.get("DB_PATH", "/var/lib/bot-engine/bot_scores.db"),
+    # Max items queued for the DB writer thread (C3 #8). Each item is a
+    # batch submitted every SNAPSHOT_INTERVAL, so 10k is ~35 days of
+    # uninterrupted backup if disk stalls — generous headroom before
+    # backpressure drops start. Override via BOT_DB_QUEUE_MAX.
+    "DB_QUEUE_MAX": int(os.environ.get("BOT_DB_QUEUE_MAX", "10000")),
 
     # ── API Protection ──
     "API_PREFIX": "/api/",
@@ -514,6 +520,19 @@ class RealtimeScoringServer:
 
         # ── Semaphore for concurrency limiting ──
         self.semaphore = asyncio.Semaphore(self.config["MAX_CONCURRENT"])
+
+        # ── Async DB write queue (C3 #8) ──
+        # Single dedicated writer thread + bounded queue. Decouples the
+        # snapshot task from the default asyncio thread pool so a slow
+        # fsync can't starve other to_thread() users (blocklist write,
+        # model load, etc.). The queue is lazy-started on first run() so
+        # tests that instantiate the server without entering the event
+        # loop don't spawn a background thread.
+        db_path = self.config["DB_PATH"]
+        self.db_queue = DbWriteQueue(
+            db_factory=lambda: ScoreDatabase(db_path),
+            max_queue=int(self.config.get("DB_QUEUE_MAX", 10_000)),
+        )
 
         self._running = False
         self._server = None
@@ -1148,28 +1167,45 @@ class RealtimeScoringServer:
             await asyncio.sleep(self.config["STATS_LOG_INTERVAL"])
             stats = self.metrics.snapshot()
             stats["engine_tracked_ips"] = len(self.engine.scores)
+            stats["db_queue"] = self.db_queue.metrics.snapshot()
             self.logger.info(f"[STATS] {json.dumps(stats)}")
             self.metrics.reset_latency()
 
     async def _snapshot_saver(self):
-        db: Optional[ScoreDatabase] = None
+        # C3 #8: DB writes flow through the dedicated queue worker instead
+        # of asyncio.to_thread(). The queue owns its own sqlite3 connection
+        # for the lifetime of the process, so we no longer reconnect-on-
+        # exception here — errors are handled inside the worker thread.
         while self._running:
             await asyncio.sleep(self.config["SNAPSHOT_INTERVAL"])
             try:
-                # Lazy-connect / reconnect on failure
-                if db is None:
-                    db = ScoreDatabase(self.config["DB_PATH"])
-
-                # Batch save all non-zero scores in one transaction
+                # Batch save all non-zero scores in one transaction. The
+                # submit returns immediately; actual fsync happens in the
+                # writer thread. If the queue is full we get False back
+                # and log — but we don't block or retry: the next snapshot
+                # cycle will re-submit with the latest state anyway.
                 to_save = [
                     t for t in self.engine.scores.values()
                     if t.total_score > 0
                 ]
                 if to_save:
-                    saved = await asyncio.to_thread(db.save_scores_batch, to_save)
-                    self.logger.info(f"[SNAPSHOT] Saved {saved} scores to DB")
+                    accepted = self.db_queue.submit_batch(to_save)
+                    if accepted:
+                        self.logger.info(
+                            f"[SNAPSHOT] Queued {len(to_save)} scores "
+                            f"(queue depth={self.db_queue.depth})"
+                        )
+                    else:
+                        self.logger.warning(
+                            "[SNAPSHOT] DB queue full — dropped %d scores "
+                            "(total drops=%d)",
+                            len(to_save),
+                            self.db_queue.metrics.dropped_full,
+                        )
 
-                # Update Nginx blocklist (also I/O-bound)
+                # Blocklist write stays on to_thread — it's a different
+                # I/O path (nginx reload) and doesn't share SQLite's
+                # single-writer constraint.
                 blocklist = self.engine.get_aggregated_blocklist()
                 if blocklist:
                     await asyncio.to_thread(
@@ -1181,17 +1217,6 @@ class RealtimeScoringServer:
                     )
             except Exception as e:
                 self.logger.error(f"Snapshot error: {e}", exc_info=True)
-                # Force reconnect on next cycle
-                if db:
-                    try:
-                        db.close()
-                    except Exception:
-                        pass
-                    db = None
-
-        # Cleanup on shutdown
-        if db:
-            db.close()
 
     async def _challenge_cleanup(self):
         while self._running:
@@ -1212,6 +1237,9 @@ class RealtimeScoringServer:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _start_background_tasks(self):
+        # Start the DB write queue worker thread before any task that
+        # might submit to it. Idempotent, so safe to call across restarts.
+        self.db_queue.start()
         asyncio.create_task(self._stats_logger())
         asyncio.create_task(self._snapshot_saver())
         asyncio.create_task(self._challenge_cleanup())
@@ -1265,6 +1293,22 @@ class RealtimeScoringServer:
         if self._server:
             self._server.close()
         self.logger.info("Server stopping...")
+
+        # Drain pending DB writes before exit. 5s is generous for the
+        # typical case (one batch every 5 minutes) and short enough that
+        # systemd's default TimeoutStopSec=90 has plenty of headroom.
+        try:
+            clean = self.db_queue.shutdown(timeout=5.0)
+            if clean:
+                m = self.db_queue.metrics.snapshot()
+                self.logger.info(
+                    "DB queue drained: written=%d batches=%d drained_on_exit=%d "
+                    "dropped=%d errors=%d",
+                    m["written"], m["batches"], m["shutdown_drained"],
+                    m["dropped_full"], m["errors"],
+                )
+        except Exception:
+            self.logger.exception("DB queue shutdown raised")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

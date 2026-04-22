@@ -78,8 +78,9 @@ TOOLING_UA_API_BONUS: 35
 
 # ── Canary endpoints (P1 #8) ──
 # Paths referenced only as dead code in the JS bundle (see
-# static/bot_canary.js). Real browsers never request them. Any hit
-# scores 100 and classifies "bad" immediately.
+# static/js/src/bot_canary.js, minified to static/js/dist/bot_canary.min.js).
+# Real browsers never request them. Any hit scores 100 and classifies
+# "bad" immediately.
 CANARY_PATHS:
   - /api/v2/_internal/models_internal
   - /api/v2/_internal/admin/api_keys
