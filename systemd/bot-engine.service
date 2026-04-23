@@ -25,7 +25,19 @@ WatchdogSec=30
 Environment=BOT_DB_PATH=/var/lib/bot-engine/bot_scores.db
 Environment=BOT_BLOCKLIST_OUTPUT=/etc/nginx/conf.d/dynamic_blocklist.conf
 Environment=BOT_HMAC_SECRET_FILE=/var/lib/bot-engine/.hmac_secret
+# C4: admin endpoints and log level come from /etc/bot-engine/env by
+# default (operators can drop the overrides there instead of editing
+# this unit). Uncomment and set inline if you prefer unit-level config.
+# Environment=BOT_ADMIN_ALLOW_IPS=127.0.0.1,::1,10.0.0.0/8
+# Environment=BOT_LOG_LEVEL=INFO
 EnvironmentFile=-/etc/bot-engine/env
+
+# C4: SIGTERM graceful shutdown. The scoring server registers signal
+# handlers that drain the DB write queue (see db_worker.py) and close
+# the listener before exiting. 15 s is generous — worst case a full
+# queue of 10k items takes ~1 s to flush on typical disks.
+KillSignal=SIGTERM
+TimeoutStopSec=15
 
 # Runtime directory (auto-created, auto-cleaned)
 RuntimeDirectory=bot-engine

@@ -278,6 +278,22 @@ class ProofOfWorkEngine:
         # No configured secret — try the persisted file.
         try:
             if secret_path.is_file():
+                # Defence-in-depth: the file holds the HMAC signing key.
+                # If it's world- or group-readable, anyone on the host
+                # who sniffs it can forge challenge signatures. In
+                # strict mode we refuse to read it rather than silently
+                # ship a compromised key. The operator's fix is one
+                # chmod away, so this is a cheap boot-time check.
+                try:
+                    mode = secret_path.stat().st_mode & 0o777
+                except OSError:
+                    mode = None
+                if strict and mode is not None and mode & 0o077:
+                    raise RuntimeError(
+                        f"HMAC secret file {secret_path} has permissions "
+                        f"{oct(mode)} — it must be 0600 (owner-only). "
+                        f"Fix with: chmod 0600 {secret_path}"
+                    )
                 persisted = secret_path.read_text().strip()
                 if persisted:
                     if strict and len(persisted) < min_len:
@@ -286,6 +302,15 @@ class ProofOfWorkEngine:
                             f"({len(persisted)} chars; need ≥{min_len}). "
                             "Delete the file to regenerate."
                         )
+                    # Quietly re-enforce 0600 on every successful read.
+                    # If the file exists and we can open it we can almost
+                    # certainly chmod it; best-effort, don't fail the
+                    # startup path over it.
+                    if mode is not None and mode != 0o600:
+                        try:
+                            secret_path.chmod(0o600)
+                        except OSError:
+                            pass
                     return persisted.encode()
         except OSError as exc:
             if strict:
@@ -295,12 +320,25 @@ class ProofOfWorkEngine:
                     "or disable strict mode with BOT_STRICT_HMAC=false."
                 ) from exc
 
-        # Generate and persist.
+        # Generate and persist. Write to a mode-0600 temp file first,
+        # then atomically rename into place — otherwise another process
+        # could open() the plaintext before our chmod(0600) lands.
         new_secret = secrets.token_hex(32)
         try:
             secret_path.parent.mkdir(parents=True, exist_ok=True)
-            secret_path.write_text(new_secret)
-            secret_path.chmod(0o600)
+            tmp_path = secret_path.with_suffix(secret_path.suffix + ".tmp")
+            # os.open with O_CREAT|O_EXCL and mode=0600 creates the file
+            # already-restricted; no window where it's world-readable.
+            fd = os.open(
+                str(tmp_path),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                os.write(fd, new_secret.encode())
+            finally:
+                os.close(fd)
+            os.replace(str(tmp_path), str(secret_path))
         except OSError as exc:
             if strict:
                 raise RuntimeError(

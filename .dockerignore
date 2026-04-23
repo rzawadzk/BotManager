@@ -1,9 +1,41 @@
-__pycache__
+# Bot Engine — Docker build context exclusions (C4)
+# Keeps the image slim and avoids leaking dev-only / secret files.
+
+# ── VCS / editor ──
+.git/
+.gitignore
+.claude/
+*.swp
+*.swo
+*~
+
+# ── Python caches ──
+__pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+
+# ── Node build artefacts (rebuilt inside the js-build stage) ──
+node_modules/
+package-lock.json
+static/js/dist/*.map
+
+# ── Test + dev artefacts ──
+tests/
 .env
+.env.*
+!.env.example
+
+# ── Runtime state that shouldn't ship in images ──
+*.db
+*.sock
+
+# ── Archives / unrelated ──
 *.zip
-.git
-.claude
+*.onnx
+
+# ── Deploy artefacts copied by the operator, not the image ──
+# systemd unit files are for bare-metal installs; nginx config is
+# applied on the host, not inside the app container.
 systemd/
 nginx/
-train_bot_model.py

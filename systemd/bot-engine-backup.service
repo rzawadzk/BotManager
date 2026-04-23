@@ -1,0 +1,29 @@
+[Unit]
+Description=Bot Engine — SQLite backup
+# Ensure the main engine has at least attempted startup; the backup
+# can legitimately run even if the engine is down (captures last-known
+# state), so we don't Require= it.
+After=bot-engine.service
+
+[Service]
+Type=oneshot
+User=bot-engine
+Group=bot-engine
+ExecStart=/opt/bot-engine/tools/backup_db.sh
+
+# Quiet failures get loud in journal so an operator can grep
+# `journalctl -u bot-engine-backup` and see the last N runs.
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening — backup only needs read access to the DB and
+# write access to /var/backups/bot-engine.
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/bot-engine
+ReadWritePaths=/var/backups/bot-engine
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

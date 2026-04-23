@@ -1,0 +1,16 @@
+[Unit]
+Description=Bot Engine — daily SQLite backup timer
+
+[Timer]
+# Daily at 03:15 UTC — after most scheduled traffic has wound down but
+# before log-rotation timers that run at 03:30+ on Debian/Ubuntu
+# defaults. Persistent=true makes systemd catch up on missed backups
+# if the host was off (laptop/dev scenarios, not prod).
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+# Randomize by up to 10 minutes so a fleet of nodes doesn't all hit
+# their backup store at the same instant.
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

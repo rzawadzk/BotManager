@@ -365,15 +365,43 @@ class RedisChallengeStore:
 # FACTORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_redis_client(url: str, *, decode_responses: bool = True):
-    """Build a Redis client from a URL, or raise a clear error."""
+def build_redis_client(
+    url: str,
+    *,
+    decode_responses: bool = True,
+    password: str | None = None,
+    socket_timeout: float = 2.0,
+    socket_connect_timeout: float = 2.0,
+):
+    """Build a Redis client from a URL, or raise a clear error.
+
+    Auth: both URL-embedded credentials (``redis://:pass@host/0``) and
+    an explicit ``password`` argument work; the argument wins when both
+    are present, so an operator who rotates the password via env var
+    doesn't need to re-template the URL.
+
+    Timeouts: default 2 s on connect and per-operation. The scoring
+    hot path does Redis work on every request; an unbounded blocking
+    client on a wedged Redis means every auth_request stalls. 2 s is
+    generous (prod Redis latency is microseconds) and guarantees the
+    scoring server falls back to in-memory rather than piling up.
+    """
     if not REDIS_AVAILABLE:
         raise RuntimeError(
             "redis package not installed. `pip install redis` to enable "
             "the Redis state backend."
         )
-    client = redis.from_url(url, decode_responses=decode_responses)
-    # Ping to fail fast if unreachable
+    kwargs: dict = {"decode_responses": decode_responses}
+    if password is not None and password != "":
+        kwargs["password"] = password
+    if socket_timeout is not None:
+        kwargs["socket_timeout"] = socket_timeout
+    if socket_connect_timeout is not None:
+        kwargs["socket_connect_timeout"] = socket_connect_timeout
+    client = redis.from_url(url, **kwargs)
+    # Ping to fail fast if unreachable / auth is wrong. Wrong-password
+    # raises ``AuthenticationError`` which subclasses RedisError — the
+    # caller's try/except in ``try_build_redis_state`` already covers it.
     client.ping()
     return client
 
@@ -384,6 +412,10 @@ def try_build_redis_state(config: dict, logger=None):
     backed by Redis using ``config["REDIS_URL"]``. Returns the tuple on
     success, or None if Redis is unavailable / unreachable. Callers should
     fall back to the in-memory implementations on None.
+
+    Reads ``config["REDIS_PASSWORD"]`` as a separate override so ops
+    teams can keep the password out of the URL (some secret-management
+    systems mount it as its own file / env var).
     """
     if config.get("STATE_BACKEND") != "redis":
         return None
@@ -392,11 +424,18 @@ def try_build_redis_state(config: dict, logger=None):
         if logger:
             logger.warning("STATE_BACKEND=redis but REDIS_URL is unset; falling back to in-memory")
         return None
+    password = config.get("REDIS_PASSWORD") or None
     try:
-        client = build_redis_client(url)
+        client = build_redis_client(url, password=password)
     except Exception as exc:
         if logger:
-            logger.warning(f"Redis backend unavailable ({exc}); falling back to in-memory")
+            # Don't log the password value even if it was the cause —
+            # the class name is enough to diagnose (AuthenticationError
+            # ⇒ wrong password, ConnectionError ⇒ unreachable).
+            logger.warning(
+                "Redis backend unavailable (%s: %s); falling back to in-memory",
+                type(exc).__name__, exc,
+            )
         return None
 
     ipv6_prefix = int(config.get("IPV6_BUCKET_PREFIX", 64))

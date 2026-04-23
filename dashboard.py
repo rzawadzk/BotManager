@@ -33,9 +33,65 @@ security = HTTPBasic(auto_error=False)
 DB_PATH = "/var/lib/bot-engine/bot_scores.db"
 
 # ── Basic auth ──
-# Set via environment or defaults. Change in production!
+# Strict mode (default) refuses to start if DASHBOARD_PASS is unset, a
+# known weak placeholder, or shorter than the minimum length. This is
+# the same pattern as BOT_HMAC_SECRET in pow_challenge.py (C2.1): the
+# failure mode for a silently-weak auth layer is "someone else owns
+# your admin UI", so we fail loud at boot instead.
+#
+# Disable with DASHBOARD_STRICT_AUTH=false for local dev / tests. The
+# compose-level :? guard on DASHBOARD_PASS already blocks the unset
+# case for docker deploys; this covers the bare-binary / systemd path.
+_WEAK_DASHBOARD_PASSWORDS = {
+    "", "changeme", "change_me", "change_me_in_production",
+    "password", "admin", "secret", "test", "default", "dashboard",
+}
+DASHBOARD_MIN_PASS_LEN = int(os.environ.get("DASHBOARD_MIN_PASS_LEN", "12"))
+DASHBOARD_STRICT_AUTH = (
+    os.environ.get("DASHBOARD_STRICT_AUTH", "true").lower() != "false"
+)
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
-DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "changeme")
+DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
+
+
+def _validate_dashboard_password(password: str) -> None:
+    """Reject unset / placeholder / short passwords at import time.
+
+    Called unconditionally; ``DASHBOARD_STRICT_AUTH=false`` downgrades
+    to a stderr warning so the legacy "oops I forgot to set it" dev
+    experience still works for non-prod.
+    """
+    problem: str | None = None
+    if not password:
+        problem = (
+            "DASHBOARD_PASS is not set. Generate a strong one with: "
+            "python3 -c 'import secrets; print(secrets.token_urlsafe(24))'"
+        )
+    elif password.lower() in _WEAK_DASHBOARD_PASSWORDS:
+        problem = (
+            f"DASHBOARD_PASS is a known weak placeholder ({password!r}). "
+            "Use a strong random value — anyone reaching the dashboard "
+            "port could try common defaults."
+        )
+    elif len(password) < DASHBOARD_MIN_PASS_LEN:
+        problem = (
+            f"DASHBOARD_PASS is too short ({len(password)} chars; "
+            f"need ≥{DASHBOARD_MIN_PASS_LEN}). The dashboard is the "
+            "control plane — don't speedrun it."
+        )
+    if problem is None:
+        return
+    if DASHBOARD_STRICT_AUTH:
+        raise RuntimeError(problem)
+    import sys as _sys
+    print(
+        f"WARNING: {problem} "
+        "(DASHBOARD_STRICT_AUTH=false — continuing anyway)",
+        file=_sys.stderr,
+    )
+
+
+_validate_dashboard_password(DASHBOARD_PASS)
 
 # ── Proxy-header trust (C2.4) ──
 # When the dashboard runs behind an auth-gating reverse proxy (oauth2-proxy,
@@ -469,6 +525,22 @@ def get_db() -> DashboardDB:
 @app.on_event("startup")
 def startup():
     get_db().ensure_tables()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    """Log a single line on SIGTERM so operators can see a clean stop.
+
+    FastAPI/uvicorn already close the request listener and wait for
+    in-flight requests before calling this hook; all we need to do is
+    drop a breadcrumb. DashboardDB connections are per-request and
+    already close themselves via context manager / GC, so there's no
+    DB cleanup needed here.
+    """
+    import logging as _logging
+    _logging.getLogger("bot-engine.dashboard").info(
+        "dashboard: graceful shutdown complete"
+    )
 
 
 # ---------------------------------------------------------------------------

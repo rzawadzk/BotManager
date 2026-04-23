@@ -50,6 +50,15 @@ services:
       # across multiple scoring nodes (requires the redis profile below).
       BOT_STATE_BACKEND: "${BOT_STATE_BACKEND:-memory}"
       BOT_REDIS_URL: "${BOT_REDIS_URL:-redis://redis:6379/0}"
+      # C4: keep the Redis password out of the URL so it doesn't show up
+      # in `ps` output or inadvertent log lines. The redis container
+      # below is started with --requirepass ${REDIS_PASSWORD}.
+      BOT_REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      # C4: admin endpoints (/_bot_stats, /_metrics) default to private
+      # ranges only. Override if your Prometheus sits outside these.
+      BOT_ADMIN_ALLOW_IPS: "${BOT_ADMIN_ALLOW_IPS:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
+      # C4: operator-tunable log level — DEBUG for diagnostics, INFO default.
+      BOT_LOG_LEVEL: "${BOT_LOG_LEVEL:-INFO}"
     volumes:
       - bot-data:/var/lib/bot-engine
       - nginx-conf:/data/nginx
@@ -118,10 +127,18 @@ services:
   # this instance so per-IP budgets aren't reset by landing on a different
   # node (C1.2).
   redis:
-    image: redis:7-alpine
+    # Pinned minor version — redis bumps have introduced config
+    # breakages historically (e.g. 6→7 moved `replicaof`). Bump with
+    # intent, not drift.
+    image: redis:7.2-alpine
     container_name: bot-redis
     command:
       - redis-server
+      # C4: password-auth the Redis. The scoring container passes
+      # REDIS_PASSWORD separately (BOT_REDIS_PASSWORD env) so it never
+      # appears in REDIS_URL.
+      - --requirepass
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD must be set when using the redis profile. Generate: python3 -c 'import secrets; print(secrets.token_urlsafe(32))'}"
       - --save
       - ""                         # no RDB snapshots — state is ephemeral
       - --appendonly
@@ -136,10 +153,17 @@ services:
     profiles:
       - redis
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Pass the password via -a. The shell form (`sh -c`) lets us
+      # expand $$REDIS_PASSWORD from the container's env — the double
+      # dollar is compose-escape for a literal $.
+      test:
+        - CMD-SHELL
+        - "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"
       interval: 10s
       timeout: 3s
       retries: 3
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
     deploy:
       resources:
         limits:

@@ -157,6 +157,26 @@ SERVER_CONFIG = {
 
     # ── API Protection ──
     "API_PREFIX": "/api/",
+
+    # ── Admin-endpoint IP allowlist (C4) ──
+    # `/_bot_stats` and `/_metrics` leak real-time traffic shape — how
+    # many requests, how many are being blocked, how deep the DB queue
+    # is. Useful for Prometheus/ops, dangerous to ship unauthenticated
+    # to the open internet. This is a comma-separated list of CIDRs.
+    # Empty-or-unset => default of localhost + RFC1918 private ranges.
+    # In docker-compose the scoring container binds to 127.0.0.1 on the
+    # host already; this is the defence if nginx accidentally proxies
+    # the admin paths, or if someone runs on 0.0.0.0 for debug and
+    # forgets to tear it down.
+    "ADMIN_ALLOW_IPS": os.environ.get(
+        "BOT_ADMIN_ALLOW_IPS",
+        "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+    ),
+
+    # ── Logging ──
+    # Log level for the scoring server. Set BOT_LOG_LEVEL=DEBUG to
+    # diagnose issues in prod; default INFO is the usual ops setting.
+    "LOG_LEVEL": os.environ.get("BOT_LOG_LEVEL", "INFO").upper(),
 }
 
 
@@ -508,6 +528,13 @@ class RealtimeScoringServer:
         # ── Whitelist ──
         self.whitelist = self.config.get("WHITELIST_IPS", set())
 
+        # ── Admin-endpoint allowlist (C4) ──
+        # Pre-parse the CIDR list once so the hot path does a cheap
+        # `ip in net` check instead of re-parsing on every request.
+        self.admin_nets = self._parse_admin_nets(
+            self.config.get("ADMIN_ALLOW_IPS", "")
+        )
+
         # ── Logging ──
         self.logger = logging.getLogger("bot-engine-rt")
         if not self.logger.handlers:
@@ -516,7 +543,12 @@ class RealtimeScoringServer:
                 "%(asctime)s [%(levelname)s] %(message)s"
             ))
             self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
+        # C4: log level is operator-tunable via BOT_LOG_LEVEL. Default
+        # INFO matches prior behaviour; DEBUG is the escape hatch when
+        # something's misbehaving in prod and you don't want to redeploy
+        # just to get more signal.
+        level_name = self.config.get("LOG_LEVEL", "INFO")
+        self.logger.setLevel(getattr(logging, level_name, logging.INFO))
 
         # ── Semaphore for concurrency limiting ──
         self.semaphore = asyncio.Semaphore(self.config["MAX_CONCURRENT"])
@@ -536,6 +568,50 @@ class RealtimeScoringServer:
 
         self._running = False
         self._server = None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Admin-endpoint access control (C4)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_admin_nets(raw: str) -> list:
+        """Parse a comma-separated CIDR list into ``ip_network`` objects.
+
+        Tolerant: bad entries are dropped with a stderr note rather than
+        failing boot — an admin allowlist with one typo shouldn't take
+        the server down. Returns a list of ``IPv4Network | IPv6Network``.
+        """
+        import ipaddress
+        nets: list = []
+        for token in (raw or "").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                nets.append(ipaddress.ip_network(token, strict=False))
+            except ValueError:
+                print(
+                    f"[realtime_server] ignoring bad ADMIN_ALLOW_IPS "
+                    f"entry: {token!r}",
+                    file=sys.stderr,
+                )
+        return nets
+
+    def _is_admin_ip(self, ip: str) -> bool:
+        """Check whether ``ip`` is in the admin allowlist.
+
+        Returns False for the literal string "unknown" (our sentinel
+        when nginx didn't send X-Real-IP) and for any value that fails
+        to parse — admin paths are default-deny.
+        """
+        if not ip or ip == "unknown":
+            return False
+        try:
+            import ipaddress
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self.admin_nets)
 
     # ──────────────────────────────────────────────────────────────────────────
     # State backend construction
@@ -560,6 +636,7 @@ class RealtimeScoringServer:
                 )
                 client = build_redis_client(
                     CONFIG.get("REDIS_URL", "redis://localhost:6379/0"),
+                    password=(CONFIG.get("REDIS_PASSWORD") or None),
                 )
                 return (
                     RedisRateTracker(
@@ -698,7 +775,18 @@ class RealtimeScoringServer:
                     return
 
                 # ── Stats endpoint ──
+                # Admin-only (C4): /_bot_stats and /_metrics expose
+                # real-time traffic shape. Nginx should never proxy
+                # these from the public listener, but if someone forgets,
+                # the IP allowlist is the seatbelt.
                 if original_uri == "/_bot_stats":
+                    if not self._is_admin_ip(ip):
+                        response = HTTPParser.build_response(
+                            403, body='{"error":"admin_only"}',
+                        )
+                        writer.write(response)
+                        await writer.drain()
+                        return
                     stats = self.metrics.snapshot()
                     stats["engine_tracked_ips"] = len(self.engine.scores)
                     if self.engine.ml_scorer.is_available:
@@ -714,6 +802,13 @@ class RealtimeScoringServer:
 
                 # ── Prometheus metrics endpoint ──
                 if original_uri == "/_metrics":
+                    if not self._is_admin_ip(ip):
+                        response = HTTPParser.build_response(
+                            403, body="admin_only\n",
+                        )
+                        writer.write(response)
+                        await writer.drain()
+                        return
                     body = self.metrics.prometheus_text()
                     response = HTTPParser.build_response(
                         200,

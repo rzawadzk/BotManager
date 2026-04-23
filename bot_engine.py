@@ -165,6 +165,10 @@ CONFIG = {
     #           "memory" if redis is unreachable at startup (fail-open).
     "STATE_BACKEND": os.environ.get("BOT_STATE_BACKEND", "memory"),
     "REDIS_URL": os.environ.get("BOT_REDIS_URL", "redis://localhost:6379/0"),
+    # Optional: pass a password outside the URL so it isn't embedded in
+    # logs / process listings. Takes precedence over any password
+    # component inside REDIS_URL. (C4)
+    "REDIS_PASSWORD": os.environ.get("BOT_REDIS_PASSWORD", ""),
 
     # ── IPv6 /64 grouping (C2.3) ──
     # Cloud providers typically allocate a full /64 to a single host, so a
