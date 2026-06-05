@@ -77,7 +77,12 @@ services:
           memory: 1G
           cpus: "2.0"
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9999/_bot_health')"]
+      # The scoring server routes on the X-Original-URI header (nginx
+      # auth_request semantics), NOT the HTTP path — a plain GET
+      # /_bot_health gets *scored* instead of hitting the health endpoint.
+      # Send the header so the probe runs _deep_health_check() (503 when
+      # degraded). See tools/smoke_test.sh for the same convention.
+      test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen(u.Request('http://127.0.0.1:9999/', headers={'X-Original-URI': '/_bot_health', 'X-Real-IP': '127.0.0.1'}), timeout=3)"]
       interval: 10s
       timeout: 3s
       retries: 3

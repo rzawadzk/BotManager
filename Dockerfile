@@ -86,8 +86,15 @@ EXPOSE 9999 8080
 
 # Container-level healthcheck — docker-compose also defines one, but
 # this lets `docker run` users get the same signal without compose.
+#
+# IMPORTANT: the scoring server routes on the X-Original-URI header
+# (nginx auth_request semantics), NOT the HTTP request path. A plain
+# GET /_bot_health is treated as a normal request to be *scored* and
+# never reaches _deep_health_check(). We must send the header so the
+# probe actually exercises the engine/DB/ML health path (which returns
+# 503 when degraded → urlopen raises → container marked unhealthy).
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9999/_bot_health')" || exit 1
+    CMD python3 -c "import urllib.request as u; u.urlopen(u.Request('http://127.0.0.1:9999/', headers={'X-Original-URI': '/_bot_health', 'X-Real-IP': '127.0.0.1'}), timeout=3)" || exit 1
 
 # Default: scoring server on TCP for Docker bridge. Override via
 # docker-compose command: for the dashboard container.
